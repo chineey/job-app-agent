@@ -23,23 +23,28 @@ dependencies or instructions do not by themselves produce better software.
   and a glob dependency with a security advisory. This backend uses neither those
   React rules nor an unsupported/forced peer install. Reassess framework/UI lint
   plugins if product UI is introduced or the preset's dependencies are updated.
-- **Useful tests:** the first primitive is request authorization, whose missing
-  config and malformed-token cases matter to future secured cron routes. No dummy
-  tests or empty-suite success flags. Later safety features require their own
-  failure and real-database concurrency tests.
+- **E2E-first verification:** verify complex behavior through real entry points,
+  state changes and recovery outcomes. Never append unit tests after writing code.
+  An isolated-test exception starts with a written failure inventory and an
+  explanation of the bug E2E cannot catch, before implementation. Do not duplicate
+  E2E assertions or add helper case tables to increase counts. The current single
+  production HTTP smoke scenario records actual response evidence and a report;
+  it is not a claim of business-feature coverage.
 - **Reproducibility:** Node 24, npm, exact direct dependency versions and the lockfile.
   CI uses SHA-pinned official actions and read-only repository permissions. It runs
-  the same checks as a contributor and receives no production credentials.
+  the same checks as a contributor, preserves E2E artifacts and receives no
+  production credentials.
 - **Independent foundation:** build/type checks and health do not require remote
   services. Integration credentials are validated at their own runtime boundaries
   when those features exist, not by connecting to providers at module import time.
 
 ## Review standard
 
-A PR explains the behavior it changes, tests actually run, shared interfaces and
-remaining limits. Review correctness, isolation, external effects, races, recovery
-and failure evidence. Distinguish defects from preferences. A passing unit suite
-does not prove provider behavior, database locking or production readiness.
+A PR explains the behavior it changes, E2E scenarios actually run, replayable
+artifacts, shared interfaces and remaining limits. Review correctness, isolation,
+external effects, races, recovery and failure evidence. Distinguish defects from
+preferences. A passing smoke check does not prove provider behavior, database
+locking or production readiness. Detailed policy: [testing](testing.md).
 
 Treat future code as absent until implemented. Do not return fabricated success
 data to make unfinished features look complete. Remove obsolete branches and
@@ -64,7 +69,10 @@ wholesale adoption of the examples or installation workflows in these sources.
   existing framework; separate local checks from resource provisioning/deployment.
 - [Next.js installation](https://nextjs.org/docs/app/getting-started/installation),
   [ESLint configuration](https://nextjs.org/docs/app/api-reference/config/eslint) and
-  [Vitest](https://vitest.dev/guide/): current framework and tool configuration.
+  [Playwright API testing](https://playwright.dev/docs/api-testing),
+  [server lifecycle](https://playwright.dev/docs/test-webserver) and
+  [reporters](https://playwright.dev/docs/test-reporters): current framework and
+  E2E runner configuration.
 
 Use applicable skills deliberately. Their examples do not authorize replacing the
 agreed stack, provisioning services, adding dependencies without a present need,

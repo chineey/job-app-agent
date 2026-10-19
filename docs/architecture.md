@@ -9,17 +9,17 @@ provider SDKs.
 
 Implemented files:
 
-| Location                   | Responsibility                                                   |
-| -------------------------- | ---------------------------------------------------------------- |
-| `app/api/health/route.ts`  | Public liveness response with no provider/config access          |
-| `app/layout.tsx`           | Minimal App Router layout; no product UI                         |
-| `lib/auth.ts`              | Fail-closed bearer-secret verification for future cron handlers  |
-| `lib/auth.test.ts`         | Missing configuration, malformed header and token mismatch cases |
-| `.github/workflows/ci.yml` | Reproducible install and the local quality gate                  |
+| Location                   | Responsibility                                                       |
+| -------------------------- | -------------------------------------------------------------------- |
+| `app/api/health/route.ts`  | Public liveness response with no provider/config access              |
+| `app/layout.tsx`           | Minimal App Router layout; no product UI                             |
+| `e2e/production.e2e.ts`    | Production HTTP startup/routing smoke scenario and response evidence |
+| `playwright.config.ts`     | Fresh server lifecycle, HTTP test runner and report outputs          |
+| `.github/workflows/ci.yml` | Reproducible install and the local quality gate                      |
 
-The authorization primitive receives configuration explicitly and compares token
-bytes with Node's constant-time comparison after a byte-length check. No cron
-endpoint exists yet; adding one requires wiring the guard before its work starts.
+No cron endpoint or authorization helper exists yet. Implement authorization when
+the first protected endpoint is added, then verify denied requests and their lack
+of protected side effects through that real HTTP boundary.
 
 ## Dependency direction
 
@@ -31,6 +31,10 @@ Use the spec's responsibility-based, flat `lib/` layout initially. Create module
 only when they have real behavior. Extract a feature directory when the code
 develops a distinct responsibility; do not build an unused layered framework.
 Controllable function arguments are enough for initial test seams.
+
+E2E is the default testing mechanism. The current scenario checks the actual built
+server, not imported handler/helper functions. It proves startup and the public
+liveness contract only; it does not establish product or provider correctness.
 
 ## Target processing flow
 
@@ -88,4 +92,5 @@ an external request. Stable Message-IDs support lookup, not provider deduplicati
 
 Before enabling real sends, test the crash-after-accept, concurrent-last-slot and
 stale-worker scenarios, plus cross-user access denial, against the actual relevant
-boundaries. PostgreSQL locking needs PostgreSQL integration tests.
+boundaries. Exercise workflows against real Postgres for database guarantees;
+follow the failure-first exception policy before adding any isolated tests.
