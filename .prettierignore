@@ -1,0 +1,8 @@
+node_modules/
+.next/
+out/
+coverage/
+.vercel/
+next-env.d.ts
+package-lock.json
+job-agent-build-spec-v3_2.md
