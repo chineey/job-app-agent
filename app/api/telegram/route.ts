@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { handleTelegramMessage } from '@/lib/telegram';
+import { handleTelegramMessage, handleTelegramDocument } from '@/lib/telegram';
 
 const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
 
@@ -16,13 +16,16 @@ export async function POST(req: NextRequest) {
     const update = await req.json();
     const message = update.message;
 
-    if (message && message.chat && message.text) {
+    if (message && message.chat) {
       const chatId = message.chat.id;
-      const text = message.text;
       const username = message.from?.username;
       const displayName = `${message.from?.first_name || ''} ${message.from?.last_name || ''}`.trim();
 
-      await handleTelegramMessage(chatId, text, username, displayName);
+      if (message.document) {
+        await handleTelegramDocument(chatId, message.document, username, displayName);
+      } else if (message.text) {
+        await handleTelegramMessage(chatId, message.text, username, displayName);
+      }
     }
 
     return NextResponse.json({ ok: true });

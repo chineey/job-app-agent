@@ -12,7 +12,7 @@ import {
 } from './schemas';
 
 const apiKey = process.env.GEMINI_API_KEY || '';
-const modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+const modelName = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
 
 const genAI = new GoogleGenerativeAI(apiKey);
 
@@ -21,7 +21,7 @@ const genAI = new GoogleGenerativeAI(apiKey);
  */
 async function fetchImagePart(url: string): Promise<Part | null> {
   try {
-    const res = await fetch(url);
+    const res = await fetch(url, { signal: AbortSignal.timeout(6000) });
     if (!res.ok) return null;
     const arrayBuffer = await res.arrayBuffer();
     const buffer = Buffer.from(arrayBuffer);
@@ -221,42 +221,55 @@ Return JSON:
 }
 
 /**
- * Generic Gemini runner with 1 retry on Zod validation failure.
+ * Generic Gemini runner with multi-model fallback and retry on 503/429 spikes or Zod validation failure.
  */
 async function callGeminiWithRetry<T>(
   prompt: string,
   parts: Part[],
   schema: { parse: (val: unknown) => T; safeParse: (val: unknown) => { success: boolean; data?: T; error?: unknown } }
 ): Promise<T> {
+  const candidateModels = Array.from(new Set([
+    process.env.GEMINI_MODEL || 'gemini-3.5-flash',
+    'gemini-3.7-flash',
+    'gemini-3.1-flash-lite',
+  ]));
+
   let lastError: Error | null = null;
   let currentPrompt = prompt;
 
-  const model = genAI.getGenerativeModel({
-    model: modelName,
-    generationConfig: {
-      responseMimeType: 'application/json',
-      temperature: 0.1,
-    },
-  });
+  for (const modelId of candidateModels) {
+    const model = genAI.getGenerativeModel({
+      model: modelId,
+      generationConfig: {
+        responseMimeType: 'application/json',
+        temperature: 0.1,
+      },
+    });
 
-  for (let attempt = 0; attempt < 2; attempt++) {
-    try {
-      const contents = [currentPrompt, ...parts];
-      const result = await model.generateContent(contents);
-      const text = result.response.text();
-      const parsedJson = JSON.parse(text);
-      const validated = schema.safeParse(parsedJson);
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const contents = [currentPrompt, ...parts];
+        const result = await model.generateContent(contents);
+        const text = result.response.text();
+        const parsedJson = JSON.parse(text);
+        const validated = schema.safeParse(parsedJson);
 
-      if (validated.success && validated.data) {
-        return validated.data;
+        if (validated.success && validated.data) {
+          return validated.data;
+        }
+
+        // Retry with schema error appended
+        const errorMsg = JSON.stringify((validated as { error: unknown }).error);
+        currentPrompt = `${prompt}\n\nPREVIOUS ATTEMPT FAILED VALIDATION WITH ERROR:\n${errorMsg}\nPlease fix and output strictly valid JSON.`;
+      } catch (err: unknown) {
+        lastError = err instanceof Error ? err : new Error(String(err));
+        console.warn(`[Gemini] Model ${modelId} attempt ${attempt + 1} failed: ${lastError.message}`);
+        if (lastError.message?.includes('503') || lastError.message?.includes('429')) {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+        } else {
+          currentPrompt = `${prompt}\n\nPREVIOUS ATTEMPT FAILED WITH ERROR: ${lastError.message}\nPlease fix and output strictly valid JSON.`;
+        }
       }
-
-      // Retry with schema error appended
-      const errorMsg = JSON.stringify((validated as { error: unknown }).error);
-      currentPrompt = `${prompt}\n\nPREVIOUS ATTEMPT FAILED VALIDATION WITH ERROR:\n${errorMsg}\nPlease fix and output strictly valid JSON.`;
-    } catch (err: unknown) {
-      lastError = err instanceof Error ? err : new Error(String(err));
-      currentPrompt = `${prompt}\n\nPREVIOUS ATTEMPT FAILED WITH ERROR: ${lastError.message}\nPlease fix and output strictly valid JSON.`;
     }
   }
 

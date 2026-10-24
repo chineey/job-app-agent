@@ -48,7 +48,10 @@ export function extractContactEmails(
 export async function checkMxRecords(domain: string): Promise<boolean> {
   if (!domain || domain.trim() === '') return false;
   try {
-    const records = await dns.resolveMx(domain.trim());
+    const records = await Promise.race([
+      dns.resolveMx(domain.trim()),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('DNS timeout')), 3000)),
+    ]);
     return records && records.length > 0;
   } catch (error) {
     return false;

@@ -151,9 +151,10 @@ export async function renewApplicationLease(id: string, token: string): Promise<
   const res = await sql`
     update applications
     set locked_at = now()
-    where id = ${id} and claim_token = ${token};
+    where id = ${id} and claim_token = ${token}
+    returning id;
   `;
-  return res.length > 0 || (res as unknown as { count: number }).count > 0;
+  return res.length > 0;
 }
 
 /**
@@ -164,9 +165,10 @@ export async function renewJobLease(id: string, token: string): Promise<boolean>
   const res = await sql`
     update jobs
     set locked_at = now()
-    where id = ${id} and claim_token = ${token};
+    where id = ${id} and claim_token = ${token}
+    returning id;
   `;
-  return res.length > 0 || (res as unknown as { count: number }).count > 0;
+  return res.length > 0;
 }
 
 /**

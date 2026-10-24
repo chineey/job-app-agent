@@ -5,7 +5,7 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { MasterFacts, MasterFactsSchema } from './schemas';
 
 const apiKey = process.env.GEMINI_API_KEY || '';
-const modelName = process.env.GEMINI_MODEL || 'gemini-1.5-flash';
+const modelName = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
 const genAI = new GoogleGenerativeAI(apiKey);
 
 export interface ResumeValidationResult {
@@ -98,13 +98,11 @@ export async function extractResumeText(buffer: Buffer, fileType: 'pdf' | 'docx'
  * Converts extracted resume text into structured MasterFacts with bullet IDs using Gemini.
  */
 export async function parseResumeTextToFacts(rawResumeText: string): Promise<MasterFacts> {
-  const model = genAI.getGenerativeModel({
-    model: modelName,
-    generationConfig: {
-      responseMimeType: 'application/json',
-      temperature: 0.1,
-    },
-  });
+  const candidateModels = Array.from(new Set([
+    process.env.GEMINI_MODEL || 'gemini-3.5-flash',
+    'gemini-3.7-flash',
+    'gemini-3.1-flash-lite',
+  ]));
 
   const prompt = `
 You are an expert technical resume parser converting raw resume text into a structured JSON Master Facts file.
@@ -135,9 +133,35 @@ Important Rules:
 - Output strictly valid JSON conforming to the schema.
 `;
 
-  const result = await model.generateContent(prompt);
-  const text = result.response.text();
-  const parsed = JSON.parse(text);
+  let lastError: any = null;
 
-  return MasterFactsSchema.parse(parsed);
+  for (const modelId of candidateModels) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const model = genAI.getGenerativeModel({
+          model: modelId,
+          generationConfig: {
+            responseMimeType: 'application/json',
+            temperature: 0.1,
+          },
+        });
+
+        const result = await model.generateContent(prompt);
+        const text = result.response.text();
+        const parsed = JSON.parse(text);
+
+        return MasterFactsSchema.parse(parsed);
+      } catch (err: any) {
+        lastError = err;
+        console.warn(`[Gemini Parse] Model ${modelId} attempt ${attempt + 1} failed: ${err.message}`);
+        if (err?.message?.includes('503') || err?.message?.includes('429')) {
+          await new Promise((resolve) => setTimeout(resolve, 1500));
+        } else {
+          break;
+        }
+      }
+    }
+  }
+
+  throw lastError || new Error('Failed to parse resume with candidate Gemini models.');
 }

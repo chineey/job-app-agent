@@ -12,6 +12,9 @@ import {
 } from './users';
 import { resolveSendAttempt } from './send';
 import { revokeGoogleToken } from './gmail';
+import { validateUploadedPdf, extractResumeText, parseResumeTextToFacts } from './parse-resume';
+import { mergeWithActiveFacts, computeFactsDiff } from './facts';
+import { MasterFacts } from './schemas';
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID ? parseInt(process.env.ADMIN_CHAT_ID, 10) : null;
@@ -270,8 +273,8 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
       await sendTelegramMessage(
         chatId,
         `🔗 *Connect Your Gmail Account*\n\n` +
-          `Click the link below to authorize sending applications from your personal Gmail:\n\n` +
-          `👉 [Authorize Gmail](${connectUrl})\n\n` +
+          `Click or open this link in your browser to authorize Gmail:\n\n` +
+          `${connectUrl}\n\n` +
           `_Link expires in 10 minutes._`
       );
       break;
@@ -430,10 +433,234 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
       break;
     }
 
-    default:
+    case '/accept': {
+      const pendingRows = (await sql`
+        select * from facts_versions
+        where user_id = ${user.id} and status = 'pending'
+        order by created_at desc limit 1;
+      `) as Array<{ id: number; facts: MasterFacts }>;
+
+      if (pendingRows.length === 0) {
+        await sendTelegramMessage(chatId, '⚠️ No pending facts version to accept. Please upload your resume first.');
+        return;
+      }
+
+      const pending = pendingRows[0];
+      if (!pending.facts.years_experience || pending.facts.years_experience <= 0) {
+        await sendTelegramMessage(
+          chatId,
+          '⚠️ Please specify your professional software engineering experience first:\n`/set years <number>`\nThen type `/accept`.'
+        );
+        return;
+      }
+
+      // Supersede previous active version
+      await sql`
+        update facts_versions
+        set status = 'superseded'
+        where user_id = ${user.id} and status = 'active';
+      `;
+
+      // Activate pending version
+      await sql`
+        update facts_versions
+        set status = 'active'
+        where id = ${pending.id};
+      `;
+
+      // Reset unsent applications to queued to regenerate with new facts
+      await sql`
+        update applications
+        set status = 'queued', updated_at = now()
+        where user_id = ${user.id} and status in ('drafted', 'verified', 'ready');
+      `;
+
+      await logEvent(user.id, 'facts_version_accepted', { versionId: pending.id });
+      await sendTelegramMessage(
+        chatId,
+        `✅ *Master Facts Accepted and Activated!*\n\n` +
+          `• Name: ${pending.facts.identity.name}\n` +
+          `• Experience: ${pending.facts.years_experience} years\n` +
+          `• Relocation: ${pending.facts.open_to_relocation ? 'Yes' : 'No'}\n` +
+          `• Strong Skills: ${pending.facts.skills.strong.slice(0, 8).join(', ')}\n\n` +
+          `Your applications will now be tailored against this verified profile.`
+      );
+      break;
+    }
+
+    case '/reject': {
+      await sql`
+        update facts_versions
+        set status = 'rejected'
+        where user_id = ${user.id} and status = 'pending';
+      `;
+      await sendTelegramMessage(chatId, '❌ Proposed resume facts discarded.');
+      break;
+    }
+
+    case '/rollback': {
+      const pastActive = (await sql`
+        select * from facts_versions
+        where user_id = ${user.id} and status = 'superseded'
+        order by created_at desc limit 1;
+      `) as Array<{ id: number }>;
+
+      if (pastActive.length === 0) {
+        await sendTelegramMessage(chatId, '⚠️ No previous facts version available to roll back to.');
+        return;
+      }
+
+      await sql`update facts_versions set status = 'superseded' where user_id = ${user.id} and status = 'active';`;
+      await sql`update facts_versions set status = 'active' where id = ${pastActive[0].id};`;
+
+      await sendTelegramMessage(chatId, `⏪ Rolled back to previous facts version (ID: ${pastActive[0].id}).`);
+      break;
+    }
+
+    case '/set': {
+      const field = args[0]?.toLowerCase();
+      const val = args.slice(1).join(' ').trim();
+
+      const targetVersion = (await sql`
+        select * from facts_versions
+        where user_id = ${user.id} and status in ('pending', 'active')
+        order by case when status = 'pending' then 1 else 2 end, created_at desc
+        limit 1;
+      `) as Array<{ id: number; facts: MasterFacts; status: string }>;
+
+      if (targetVersion.length === 0) {
+        await sendTelegramMessage(chatId, '⚠️ Please upload a resume first before setting attributes.');
+        return;
+      }
+
+      const current = targetVersion[0];
+      const updatedFacts = { ...current.facts };
+
+      if (field === 'years') {
+        const num = parseInt(val, 10);
+        if (isNaN(num) || num < 0) {
+          await sendTelegramMessage(chatId, 'Usage: `/set years <number>` (e.g. `/set years 4`)');
+          return;
+        }
+        updatedFacts.years_experience = num;
+        await sendTelegramMessage(chatId, `✅ Experience set to ${num} years.`);
+      } else if (field === 'relocation') {
+        const isRelo = ['yes', 'true', '1', 'y'].includes(val.toLowerCase());
+        updatedFacts.open_to_relocation = isRelo;
+        await sendTelegramMessage(chatId, `✅ Open to relocation set to: ${isRelo ? 'Yes' : 'No'}.`);
+      } else if (field === 'framing') {
+        if (!val) {
+          await sendTelegramMessage(chatId, 'Usage: `/set framing <sentence>`');
+          return;
+        }
+        updatedFacts.gap_framing = val;
+        await sendTelegramMessage(chatId, `✅ Gap framing sentence updated:\n"${val}"`);
+      } else if (field === 'gaps') {
+        const gapsList = val.split(',').map((g) => g.trim()).filter(Boolean);
+        updatedFacts.skills.known_gaps = gapsList;
+        await sendTelegramMessage(chatId, `✅ Known gaps updated: ${gapsList.join(', ')}`);
+      } else {
+        await sendTelegramMessage(
+          chatId,
+          `Usage:\n• \`/set years <N>\`\n• \`/set relocation yes|no\`\n• \`/set framing <text>\`\n• \`/set gaps <a, b, c>\``
+        );
+        return;
+      }
+
+      await sql`
+        update facts_versions
+        set facts = ${JSON.stringify(updatedFacts)}
+        where id = ${current.id};
+      `;
+
+      if (current.status === 'pending') {
+        await sendTelegramMessage(chatId, 'Type `/accept` to lock in these changes.');
+      }
+      break;
+    }
+
+    case '/resumemode': {
+      const mode = args[0]?.toLowerCase();
+      if (!mode) {
+        await sendTelegramMessage(
+          chatId,
+          `📄 *Current Resume Mode:* \`${settings.resume_mode}\`\n\n` +
+            `• \`generated\`: Tailored 1-page ATS template created per application (default).\n` +
+            `• \`uploaded\`: Your uploaded PDF is attached unchanged byte-for-byte; email copy only is tailored.\n\n` +
+            `Switch with: \`/resumemode generated\` or \`/resumemode uploaded\``
+        );
+        return;
+      }
+
+      if (mode !== 'generated' && mode !== 'uploaded') {
+        await sendTelegramMessage(chatId, 'Usage: `/resumemode generated` or `/resumemode uploaded`');
+        return;
+      }
+
+      await updateUserSettings(user.id, { resume_mode: mode });
+      await sendTelegramMessage(chatId, `✅ Resume mode updated to: \`${mode}\`.`);
+      break;
+    }
+
+    case '/run': {
+      await sendTelegramMessage(
+        chatId,
+        '🚀 *Triggering Pipeline Run...*\n\n' +
+          '1️⃣ Ingesting from X API...\n' +
+          '2️⃣ Extracting & matching with Gemini 3.7...\n' +
+          '3️⃣ Running send / dry-run preview pass...'
+      );
+
+      const baseUrl = process.env.APP_BASE_URL || 'http://localhost:3000';
+      const cronSecret = process.env.CRON_SECRET || 'd7c9e00d19b3f3376fce8ae9a3904858';
+      const headers = { Authorization: `Bearer ${cronSecret}` };
+
+      try {
+        const ingestRes = await fetch(`${baseUrl}/api/cron/ingest`, { headers }).then((r) => r.json());
+        const processRes = await fetch(`${baseUrl}/api/cron/process`, { headers }).then((r) => r.json());
+        const sendRes = await fetch(`${baseUrl}/api/cron/send`, { headers }).then((r) => r.json());
+
+        const summaryMsg =
+          `✅ *Pipeline Run Completed!*\n\n` +
+          `• *Ingested:* ${ingestRes.jobsInserted ?? 0} new jobs (searched ${ingestRes.tweetsFetched ?? 0})\n` +
+          `• *Jobs Extracted:* ${processRes.summary?.jobsExtracted ?? 0}\n` +
+          `• *Applications Matched:* ${processRes.summary?.applicationsMatched ?? 0}\n` +
+          `• *Applications Tailored:* ${processRes.summary?.applicationsTailored ?? 0}\n` +
+          `• *Dry-Run Previews:* ${sendRes.dryRuns ?? 0}\n` +
+          `• *Live Emails Sent:* ${sendRes.sent ?? 0}\n` +
+          (sendRes.skipped ? `• *Skipped:* ${sendRes.skipped} (cap limit or outside window)\n` : '');
+
+        await sendTelegramMessage(chatId, summaryMsg);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        await sendTelegramMessage(chatId, `❌ Pipeline execution error: ${msg}`);
+      }
+      break;
+    }
+
+    default: {
+      const tweetMatch = text.match(/(?:twitter|x)\.com\/\w+\/status\/(\d+)/i);
+      if (tweetMatch) {
+        await sendTelegramMessage(chatId, `🔍 *Detected Job Post URL!* Processing via pipeline...`);
+        const baseUrl = process.env.APP_BASE_URL || 'http://localhost:3000';
+        const cronSecret = process.env.CRON_SECRET || 'd7c9e00d19b3f3376fce8ae9a3904858';
+        const headers = { Authorization: `Bearer ${cronSecret}` };
+
+        try {
+          await fetch(`${baseUrl}/api/cron/process`, { headers });
+          await fetch(`${baseUrl}/api/cron/send`, { headers });
+          await sendTelegramMessage(chatId, `✅ Finished processing post!`);
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err);
+          await sendTelegramMessage(chatId, `❌ Error processing post: ${msg}`);
+        }
+        break;
+      }
+
       await sendTelegramMessage(
         chatId,
         `Unknown command. Available commands:\n` +
+          `• \`/run\` - 🚀 Run full pipeline (Ingest → Tailor → Send)\n` +
           `• \`/status\` - Overview & queue stats\n` +
           `• \`/connect\` - Link your Gmail\n` +
           `• \`/pause\` / \`/resume\` - Pause/resume sends\n` +
@@ -441,9 +668,124 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
           `• \`/dry on|off\` - Toggle dry-run mode\n` +
           `• \`/window <H1> <H2>\` - Set send window\n` +
           `• \`/timezone <zone>\` - Set timezone\n` +
+          `• \`/set years <N>\` - Set years of experience\n` +
+          `• \`/accept\` - Approve proposed facts\n` +
+          `• \`/resumemode\` - Check or switch resume mode\n` +
           `• \`/done <id>\` - Mark link job as applied`
       );
       break;
+    }
+  }
+}
+
+/**
+ * Handles document uploads from Telegram (PDF/DOCX resumes).
+ */
+export async function handleTelegramDocument(
+  chatId: number,
+  document: { file_id: string; file_name?: string; file_size?: number; mime_type?: string },
+  username?: string,
+  displayName?: string
+): Promise<void> {
+  const user = await getUserByChatId(chatId);
+  if (!user || user.status === 'pending' || user.status === 'suspended') {
+    await sendTelegramMessage(chatId, '⚠️ Please accept the privacy notice with `/agree` first before uploading a resume.');
+    return;
+  }
+
+  const fileName = document.file_name || 'resume.pdf';
+  const isPdf = fileName.toLowerCase().endsWith('.pdf');
+  const isDocx = fileName.toLowerCase().endsWith('.docx');
+
+  if (!isPdf && !isDocx) {
+    await sendTelegramMessage(chatId, '❌ Unsupported file format. Please upload your resume as a `.pdf` or `.docx` document.');
+    return;
+  }
+
+  await sendTelegramMessage(chatId, '📥 *Resume received!* Validating and extracting your skills and experience...');
+
+  try {
+    // 1. Get file path from Telegram
+    const fileRes = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${document.file_id}`);
+    const fileData = await fileRes.json();
+    if (!fileData.ok || !fileData.result?.file_path) {
+      throw new Error('Failed to retrieve file location from Telegram.');
+    }
+
+    // 2. Download file buffer
+    const downloadRes = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${fileData.result.file_path}`);
+    const arrayBuf = await downloadRes.arrayBuffer();
+    const buffer = Buffer.from(arrayBuf);
+
+    let pageCount: number | undefined;
+    let sha256Hex: string | undefined;
+
+    // 3. Validate PDF
+    if (isPdf) {
+      const validation = await validateUploadedPdf(buffer);
+      if (!validation.valid) {
+        await sendTelegramMessage(chatId, `❌ Resume rejected: ${validation.error}`);
+        return;
+      }
+      pageCount = validation.pageCount;
+      sha256Hex = validation.sha256;
+    }
+
+    // 4. Extract raw text
+    const rawText = await extractResumeText(buffer, isPdf ? 'pdf' : 'docx');
+
+    // 5. Convert to structured MasterFacts with Gemini
+    const parsedFacts = await parseResumeTextToFacts(rawText);
+
+    // 6. Fetch previous active facts (if any) to carry over non-inferables
+    const activeFactsRows = (await sql`
+      select facts from facts_versions
+      where user_id = ${user.id} and status = 'active'
+      limit 1;
+    `) as Array<{ facts: MasterFacts }>;
+
+    const activeFacts = activeFactsRows[0]?.facts || null;
+    const mergedFacts = mergeWithActiveFacts(parsedFacts, activeFacts);
+    const diff = computeFactsDiff(activeFacts, mergedFacts);
+
+    // 7. Store as pending version
+    const diffSummaryText = [
+      diff.added_projects.length > 0 ? `Projects: ${diff.added_projects.join(', ')}` : '',
+      diff.experience_changes.length > 0 ? `Roles: ${diff.experience_changes.join('; ')}` : '',
+    ].filter(Boolean).join('\n');
+
+    const insertRes = (await sql`
+      insert into facts_versions (
+        user_id, source, facts, diff_summary, source_file_pages, source_file_sha256, status
+      ) values (
+        ${user.id}, 'telegram_upload', ${JSON.stringify(mergedFacts)}, ${diffSummaryText},
+        ${pageCount || null}, ${sha256Hex || null}, 'pending'
+      )
+      returning id;
+    `) as Array<{ id: number }>;
+
+    await logEvent(user.id, 'resume_uploaded_and_parsed', { versionId: insertRes[0].id, isPdf });
+
+    // 8. Send summary to user
+    await sendTelegramMessage(
+      chatId,
+      `📋 *Resume Extracted Successfully!*\n\n` +
+        `*Name:* ${mergedFacts.identity.name || 'Not detected'}\n` +
+        `*Email:* ${mergedFacts.identity.email || 'Not detected'}\n` +
+        `*Experience:* ${mergedFacts.years_experience} years\n` +
+        `*Open to Relocation:* ${mergedFacts.open_to_relocation ? 'Yes' : 'No'}\n` +
+        `*Roles Found:* ${mergedFacts.experience.length}\n` +
+        `*Projects Found:* ${mergedFacts.projects.length}\n` +
+        `*Strong Skills:* ${mergedFacts.skills.strong.slice(0, 10).join(', ')}\n\n` +
+        `👉 *Next Steps to Activate:*\n` +
+        `1. Set your professional years of experience: \`/set years <N>\`\n` +
+        `2. (Optional) Set relocation: \`/set relocation yes|no\`\n` +
+        `3. When ready, approve this profile: \`/accept\``
+    );
+  } catch (err: unknown) {
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    console.error('Error handling resume upload:', err);
+    await sendTelegramMessage(chatId, `❌ Failed to parse resume: ${errorMsg}`);
   }
 }
 
