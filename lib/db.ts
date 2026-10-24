@@ -1,9 +1,6 @@
 import { neon, neonConfig } from '@neondatabase/serverless';
 
-// Disable connection caching in serverless environments if needed
-neonConfig.fetchConnectionCache = true;
-
-const connectionString = process.env.DATABASE_URL || '';
+const connectionString = process.env.DATABASE_URL || 'postgres://mock:mock@localhost:5432/mock';
 
 export const sql = neon(connectionString);
 

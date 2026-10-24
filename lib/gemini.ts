@@ -262,3 +262,74 @@ async function callGeminiWithRetry<T>(
 
   throw lastError || new Error('Gemini structured output failed after retry');
 }
+
+import { ReplyClassification, ReplyClassificationSchema, ReplyDraft, ReplyDraftSchema } from './schemas';
+
+/**
+ * Classifies an inbound recruiter reply into standard categories.
+ */
+export async function classifyRecruiterReply(emailText: string): Promise<ReplyClassification> {
+  const prompt = `
+You are an expert recruiter assistant evaluating an inbound email from a hiring company.
+Categorize this message into strictly one of:
+- "interview": scheduling phone screen, technical interview, or call.
+- "assessment": take-home coding assignment, HackerRank/LeetCode link, quiz.
+- "question": clarifying question about experience, salary, availability.
+- "rejection": explicit rejection or notification that role has been filled.
+- "auto": automatic receipt acknowledgement or out-of-office message.
+- "other": anything else.
+
+Inbound Message Text:
+"""
+${emailText}
+"""
+
+Return JSON:
+{
+  "category": "interview" | "assessment" | "question" | "rejection" | "auto" | "other",
+  "summary": "1-sentence summary of the message",
+  "suggested_action": "1-sentence recommendation"
+}
+`;
+
+  return callGeminiWithRetry<ReplyClassification>(prompt, [], ReplyClassificationSchema);
+}
+
+/**
+ * Drafts a professional reply to a recruiter query or interview invitation.
+ */
+export async function generateReplyDraft(
+  inboundText: string,
+  facts: MasterFacts,
+  availabilityNote?: string
+): Promise<ReplyDraft> {
+  const prompt = `
+You are drafting a professional, polite, and concise email reply to a recruiter on behalf of ${facts.identity.name}.
+Follow these strict guidelines:
+1. Tone: Professional, direct, humble, concise. Plain text only.
+2. If the recruiter asked for interview availability:
+   ${availabilityNote ? `Use candidate's availability note: "${availabilityNote}".` : 'Propose NO specific times. Leave a clear placeholder like "[Insert your preferred times here]".'}
+3. Grounding: Do NOT invent experience or skills. Only reference verified candidate facts.
+
+Inbound Recruiter Message:
+"""
+${inboundText}
+"""
+
+Candidate Master Facts:
+${JSON.stringify({
+  name: facts.identity.name,
+  years_experience: facts.years_experience,
+  skills: facts.skills.strong,
+})}
+
+Return JSON:
+{
+  "reply_body": "string (the full draft text)",
+  "availability_placeholder_used": boolean
+}
+`;
+
+  return callGeminiWithRetry<ReplyDraft>(prompt, [], ReplyDraftSchema);
+}
+

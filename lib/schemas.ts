@@ -152,3 +152,22 @@ export const VerifyOutputSchema = z.object({
 });
 
 export type VerifyOutput = z.infer<typeof VerifyOutputSchema>;
+
+// ==========================================
+// 6. Recruiter Reply Classification & Draft Schema (Dev B, Section 7.10)
+// ==========================================
+
+export const ReplyClassificationSchema = z.object({
+  category: z.enum(['interview', 'assessment', 'question', 'rejection', 'auto', 'other']),
+  summary: z.string().default(''),
+  suggested_action: z.string().default(''),
+});
+
+export type ReplyClassification = z.infer<typeof ReplyClassificationSchema>;
+
+export const ReplyDraftSchema = z.object({
+  reply_body: z.string().min(10, 'Reply body must be substantial'),
+  availability_placeholder_used: z.boolean().default(false),
+});
+
+export type ReplyDraft = z.infer<typeof ReplyDraftSchema>;
