@@ -54,4 +54,4 @@ npm run test:e2e
 
 The test-only variables `GOOGLE_API_ROOT_URL`, `GOOGLE_OAUTH_TOKEN_URL` and `TELEGRAM_API_BASE_URL` point the app at the fake server. They must stay unset in every real environment.
 
-Requirements: Node 24 and PostgreSQL binaries (`initdb`, `pg_ctl`) on `PATH`. Reports are written to `artifacts/e2e/send-safety/` (`junit.xml`, `report.txt` and one JSON evidence file per scenario).
+Requirements: Node 24 and PostgreSQL binaries (`initdb`, `pg_ctl`) on `PATH`. Reports are written to `artifacts/e2e/` (`junit.xml` and `report.txt` for all suites) with one JSON evidence file per scenario under `artifacts/e2e/send-safety/`.

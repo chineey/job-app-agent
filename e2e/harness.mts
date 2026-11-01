@@ -1,6 +1,6 @@
-// Test infrastructure for the send-safety E2E suite: a throwaway Postgres cluster, a fake
-// Google/Telegram server, and the production Next.js server pointed at both.
-// See docs/send-safety.md for what the scenarios prove.
+// Shared E2E infrastructure: a throwaway Postgres cluster, a fake Google/Telegram server,
+// and the production Next.js server pointed at both. Each *.e2e.mts file is one suite;
+// docs/send-safety.md and docs/telegram-access.md describe what they prove.
 
 import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
@@ -11,7 +11,7 @@ import crypto from 'node:crypto';
 import pg from 'pg';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
-export const EVIDENCE_DIR = path.join(ROOT, 'artifacts', 'e2e', 'send-safety');
+const EVIDENCE_ROOT = path.join(ROOT, 'artifacts', 'e2e');
 
 const PG_PORT = 55433;
 const FAKE_PORT = 3110;
@@ -22,6 +22,7 @@ const FAKE_URL = `http://127.0.0.1:${FAKE_PORT}`;
 const CRON_SECRET = 'e2e-cron-secret';
 const WEBHOOK_SECRET = 'e2e-webhook-secret';
 const BOT_TOKEN = 'e2e-bot-token';
+export const ADMIN_CHAT_ID = 1;
 const ENCRYPTION_KEY = crypto.randomBytes(32);
 export const RESUME_URL = `${FAKE_URL}/resume.pdf`;
 
@@ -69,7 +70,7 @@ export async function startPostgres(): Promise<Database> {
 export async function resetDatabase(db: Database): Promise<void> {
   await db.pool.query(`
     truncate users, invites, oauth_states, user_settings, facts_versions, jobs, applications,
-             send_state, send_attempts, spend, user_spend, events restart identity cascade;
+             send_state, send_attempts, spend, user_spend, events, telegram_updates restart identity cascade;
     update global_settings set value = 'false' where key = 'global_paused';
   `);
 }
@@ -138,11 +139,15 @@ export async function seedAttempt(
   return rows[0].id;
 }
 
-/** Holds the account's send_state row lock so workers queue up behind it, as they would under load. */
-export async function holdSendStateLock(db: Database, userId: string): Promise<{ release(): Promise<void> }> {
+/**
+ * Runs a locking query (`select ... for update`) in an open transaction, so concurrent requests
+ * queue up behind it as they would under load. Releasing commits and lets them race.
+ */
+export async function holdRowLock(db: Database, lockingQuery: string, params: unknown[]): Promise<{ release(): Promise<void> }> {
   const client = await db.pool.connect();
   await client.query('begin');
-  await client.query('select 1 from send_state where user_id = $1 for update', [userId]);
+  const { rowCount } = await client.query(lockingQuery, params);
+  if (rowCount === 0) throw new Error(`Lock query matched no rows: ${lockingQuery}`);
   return {
     async release() {
       await client.query('commit');
@@ -326,7 +331,7 @@ export async function startApp(databaseUrl: string): Promise<AppServer> {
       TELEGRAM_BOT_TOKEN: BOT_TOKEN,
       TELEGRAM_WEBHOOK_SECRET: WEBHOOK_SECRET,
       TELEGRAM_API_BASE_URL: FAKE_URL,
-      ADMIN_CHAT_ID: '1',
+      ADMIN_CHAT_ID: String(ADMIN_CHAT_ID),
       GMAIL_CLIENT_ID: 'e2e-client-id',
       GMAIL_CLIENT_SECRET: 'e2e-client-secret',
       GOOGLE_API_ROOT_URL: `${FAKE_URL}/`,
@@ -370,28 +375,51 @@ export async function runSendCron(): Promise<Record<string, unknown>> {
 
 let nextUpdateId = 1;
 
+export function telegramUpdate(
+  chatId: number,
+  text: string,
+  options: { chatType?: 'private' | 'group'; updateId?: number } = {}
+): Record<string, unknown> {
+  const updateId = options.updateId ?? nextUpdateId++;
+  return {
+    update_id: updateId,
+    message: {
+      message_id: updateId,
+      from: { id: chatId, first_name: 'Synthetic' },
+      chat: { id: chatId, type: options.chatType ?? 'private' },
+      text,
+    },
+  };
+}
+
+/** Posts an update to the webhook; `secret: null` omits the header. Returns the HTTP status. */
+export async function postTelegramUpdate(
+  update: Record<string, unknown>,
+  secret: string | null = WEBHOOK_SECRET
+): Promise<number> {
+  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  if (secret !== null) headers['x-telegram-bot-api-secret-token'] = secret;
+  const res = await fetch(`${APP_URL}/api/telegram`, { method: 'POST', headers, body: JSON.stringify(update) });
+  return res.status;
+}
+
 export async function sendTelegramCommand(chatId: number, text: string): Promise<void> {
-  const res = await fetch(`${APP_URL}/api/telegram`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-telegram-bot-api-secret-token': WEBHOOK_SECRET },
-    body: JSON.stringify({
-      update_id: nextUpdateId++,
-      message: {
-        message_id: nextUpdateId,
-        from: { id: chatId, first_name: 'Synthetic' },
-        chat: { id: chatId, type: 'private' },
-        text,
-      },
-    }),
-  });
-  if (res.status !== 200) {
-    throw new Error(`Telegram webhook answered ${res.status}`);
+  const status = await postTelegramUpdate(telegramUpdate(chatId, text));
+  if (status !== 200) {
+    throw new Error(`Telegram webhook answered ${status}`);
   }
+}
+
+/** Replies the bot sent to one chat, oldest first. */
+export function repliesTo(fake: FakeProviders, chatId: number): string[] {
+  return fake.telegram.filter((m) => Number(m.chatId) === chatId).map((m) => m.text);
 }
 
 // ---------------------------------------------------------------- Evidence
 
-export function writeEvidence(scenario: string, evidence: Record<string, unknown>): void {
-  mkdirSync(EVIDENCE_DIR, { recursive: true });
-  writeFileSync(path.join(EVIDENCE_DIR, `${scenario}.json`), `${JSON.stringify(evidence, null, 2)}\n`);
+export function writeEvidence(suite: string, scenario: string, evidence: Record<string, unknown>): void {
+  const dir = path.join(EVIDENCE_ROOT, suite);
+  mkdirSync(dir, { recursive: true });
+  const name = scenario.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+  writeFileSync(path.join(dir, `${name}.json`), `${JSON.stringify(evidence, null, 2)}\n`);
 }

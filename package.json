@@ -10,7 +10,7 @@
     "start": "next start",
     "lint": "next lint",
     "test": "vitest run",
-    "test:e2e": "rm -rf artifacts/e2e/send-safety && mkdir -p artifacts/e2e/send-safety && node --test --test-concurrency=1 --test-reporter=spec --test-reporter-destination=stdout --test-reporter=spec --test-reporter-destination=artifacts/e2e/send-safety/report.txt --test-reporter=junit --test-reporter-destination=artifacts/e2e/send-safety/junit.xml e2e/send-safety.e2e.mts"
+    "test:e2e": "rm -rf artifacts/e2e && mkdir -p artifacts/e2e && node --test --test-concurrency=1 --test-reporter=spec --test-reporter-destination=stdout --test-reporter=spec --test-reporter-destination=artifacts/e2e/report.txt --test-reporter=junit --test-reporter-destination=artifacts/e2e/junit.xml e2e/*.e2e.mts"
   },
   "dependencies": {
     "@google/generative-ai": "^0.21.0",

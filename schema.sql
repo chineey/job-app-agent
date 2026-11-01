@@ -257,3 +257,9 @@ create table if not exists events (
   type text,
   detail jsonb
 );
+
+-- Telegram update ids already handled, so a redelivered update never runs a command twice.
+create table if not exists telegram_updates (
+  update_id bigint primary key,
+  received_at timestamptz not null default now()
+);

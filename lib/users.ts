@@ -1,6 +1,6 @@
 import crypto from 'crypto';
 import { escapeIdentifier } from 'pg';
-import { sql, query, logEvent, assertUserScope } from './db';
+import { sql, query, withTransaction, logEvent, assertUserScope } from './db';
 
 export interface UserRecord {
   id: string;
@@ -67,39 +67,6 @@ export async function createInvite(createdByUserId: string | null, maxUses: numb
 }
 
 /**
- * Validates whether an invite code is valid and available.
- */
-export async function validateInvite(code: string): Promise<{ valid: boolean; reason?: string }> {
-  const rows = (await sql`
-    select * from invites where code = ${code.trim().toUpperCase()} limit 1;
-  `) as InviteRecord[];
-
-  if (rows.length === 0) {
-    return { valid: false, reason: 'Invalid invite code.' };
-  }
-
-  const invite = rows[0];
-  if (invite.uses >= invite.max_uses) {
-    return { valid: false, reason: 'Invite code has already been used.' };
-  }
-
-  if (invite.expires_at && new Date(invite.expires_at) < new Date()) {
-    return { valid: false, reason: 'Invite code has expired.' };
-  }
-
-  // Check system-wide user cap
-  const userCountRows = (await sql`
-    select count(*)::int as count from users where status != 'deleted';
-  `) as { count: number }[];
-
-  if (userCountRows[0].count >= MAX_USERS) {
-    return { valid: false, reason: `System user capacity reached (${MAX_USERS} users).` };
-  }
-
-  return { valid: true };
-}
-
-/**
  * Retrieves user by Telegram Chat ID.
  */
 export async function getUserByChatId(chatId: number): Promise<UserRecord | null> {
@@ -120,62 +87,87 @@ export async function getUserById(userId: string): Promise<UserRecord | null> {
   return rows.length > 0 ? rows[0] : null;
 }
 
+export type Registration =
+  | { outcome: 'created'; user: UserRecord }
+  | { outcome: 'already_registered' }
+  | { outcome: 'rejected'; reason: string };
+
 /**
- * Creates a new user in 'pending' status and initializes default settings.
+ * Registers a chat as a 'pending' user with default settings (dry run on).
+ * The admin (ADMIN_CHAT_ID) needs no invite; everyone else redeems one.
  */
-export async function createUserWithInvite(
+export async function registerUser(
   chatId: number,
   username: string | null,
   displayName: string | null,
-  inviteCode: string
-): Promise<UserRecord> {
-  const code = inviteCode.trim().toUpperCase();
-  const validation = await validateInvite(code);
-  if (!validation.valid) {
-    throw new Error(validation.reason || 'Invalid invite');
+  inviteCode: string | null
+): Promise<Registration> {
+  const isAdmin = ADMIN_CHAT_ID !== null && chatId === ADMIN_CHAT_ID;
+  const code = inviteCode?.trim().toUpperCase() ?? null;
+  if (!isAdmin && !code) {
+    return { outcome: 'rejected', reason: 'An invite code is required: `/start <code>`' };
   }
 
-  const role = ADMIN_CHAT_ID !== null && chatId === ADMIN_CHAT_ID ? 'admin' : 'user';
+  const registration = await withTransaction(async (tx): Promise<Registration> => {
+    // Serializes registrations so the MAX_USERS count below cannot be passed by two at once.
+    await tx`select pg_advisory_xact_lock(hashtext('user_registration'))`;
 
-  // Create user
-  const userRows = (await sql`
-    insert into users (
-      telegram_chat_id, telegram_username, display_name, role, status
-    ) values (
-      ${chatId}, ${username}, ${displayName}, ${role}, 'pending'
-    )
-    returning *;
-  `) as UserRecord[];
+    if (!isAdmin) {
+      // The row lock makes check-then-increment atomic: a single-use code admits one user.
+      const [invite] = (await tx`
+        select uses, max_uses, expires_at is not null and expires_at < now() as expired
+        from invites where code = ${code} for update
+      `) as Array<{ uses: number; max_uses: number; expired: boolean }>;
+      if (!invite) return { outcome: 'rejected', reason: 'Invalid invite code.' };
+      if (invite.uses >= invite.max_uses) return { outcome: 'rejected', reason: 'Invite code has already been used.' };
+      if (invite.expired) return { outcome: 'rejected', reason: 'Invite code has expired.' };
 
-  const newUser = userRows[0];
+      const [registered] = (await tx`
+        select count(*)::int as count from users where status != 'deleted'
+      `) as Array<{ count: number }>;
+      if (registered.count >= MAX_USERS) {
+        return { outcome: 'rejected', reason: `System user capacity reached (${MAX_USERS} users).` };
+      }
+    }
 
-  // Increment invite usage
-  await sql`
-    update invites set uses = uses + 1 where code = ${code};
-  `;
+    const [user] = (await tx`
+      insert into users (telegram_chat_id, telegram_username, display_name, role, status)
+      values (${chatId}, ${username}, ${displayName}, ${isAdmin ? 'admin' : 'user'}, 'pending')
+      on conflict (telegram_chat_id) do nothing
+      returning *
+    `) as UserRecord[];
+    if (!user) return { outcome: 'already_registered' };
 
-  // Create user default settings
-  await sql`
-    insert into user_settings (
-      user_id, paused, dry_run, ramp_stage, current_cap, max_cap,
-      daily_read_cap, max_reads_ceiling, manual_daily_cap, fit_threshold,
-      timezone, send_window_start, send_window_end, min_send_gap_seconds,
-      resume_mode
-    ) values (
-      ${newUser.id}, false, true, 0, 3, 20,
-      50, 100, 5, 40,
-      'UTC', 9, 17, 120,
-      'generated'
-    ) on conflict (user_id) do nothing;
-  `;
+    if (!isAdmin) {
+      await tx`update invites set uses = uses + 1 where code = ${code}`;
+    }
+    // Schema defaults are the onboarding defaults, including dry_run = true.
+    await tx`insert into user_settings (user_id) values (${user.id})`;
+    await tx`insert into send_state (user_id) values (${user.id})`;
+    return { outcome: 'created', user };
+  });
 
-  // Initialize send_state row
-  await sql`
-    insert into send_state (user_id) values (${newUser.id}) on conflict (user_id) do nothing;
-  `;
+  if (registration.outcome === 'created') {
+    await logEvent(registration.user.id, 'user_onboarded', {
+      chatId,
+      username,
+      role: registration.user.role,
+      inviteCode: code,
+    });
+  }
+  return registration;
+}
 
-  await logEvent(newUser.id, 'user_onboarded', { chatId, username, role, inviteCode: code });
-  return newUser;
+/**
+ * Returns the canonical IANA name for a timezone, or null if Intl does not know it.
+ * Send queries use it with Postgres `at time zone`, which throws on an unknown name.
+ */
+export function canonicalTimeZone(timeZone: string): string | null {
+  try {
+    return new Intl.DateTimeFormat('en-US', { timeZone }).resolvedOptions().timeZone;
+  } catch {
+    return null;
+  }
 }
 
 /**

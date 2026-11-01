@@ -1,7 +1,8 @@
 import { sql, logEvent } from './db';
 import {
   getUserByChatId,
-  createUserWithInvite,
+  registerUser,
+  canonicalTimeZone,
   agreeToTerms,
   getUserSettings,
   updateUserSettings,
@@ -149,6 +150,24 @@ export async function dispatchLinkOpportunityCard(
 }
 
 /**
+ * Records a Telegram update id. Returns false if it was already handled (Telegram redelivered it).
+ */
+export async function claimTelegramUpdate(updateId: number): Promise<boolean> {
+  const rows = await sql`
+    insert into telegram_updates (update_id) values (${updateId})
+    on conflict (update_id) do nothing
+    returning update_id
+  `;
+  return rows.length > 0;
+}
+
+const ADMIN_COMMANDS = new Set(['/invite', '/users', '/suspend', '/unsuspend', '/limits']);
+
+function isAdminCommand(command: string): boolean {
+  return command.startsWith('/admin') || ADMIN_COMMANDS.has(command);
+}
+
+/**
  * Main Telegram Command Router.
  */
 export async function handleTelegramMessage(chatId: number, text: string, username?: string, displayName?: string): Promise<void> {
@@ -160,17 +179,23 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
   // 1. Check if user exists
   let user = await getUserByChatId(chatId);
 
-  // Allow /start <code> for unauthenticated users
+  // Unknown chats may only register: /start <code>, or /start alone for the admin.
   if (!user) {
     if (command === '/start') {
-      const inviteCode = args[0];
-      if (!inviteCode) {
-        await sendTelegramMessage(chatId, '❌ Welcome! To get started, please provide an invite code:\n`/start <code>`');
+      let registration;
+      try {
+        registration = await registerUser(chatId, username || null, displayName || null, args[0] ?? null);
+      } catch (err) {
+        console.error(`Registration failed for chat ${chatId}:`, err);
+        await sendTelegramMessage(chatId, '❌ Registration failed. Please try again later.');
         return;
       }
 
-      try {
-        user = await createUserWithInvite(chatId, username || null, displayName || null, inviteCode);
+      if (registration.outcome === 'rejected') {
+        await sendTelegramMessage(chatId, `❌ ${registration.reason}`);
+      } else if (registration.outcome === 'already_registered') {
+        await sendTelegramMessage(chatId, 'This chat is already registered. Type `/agree` to continue.');
+      } else {
         await sendTelegramMessage(
           chatId,
           `👋 *Welcome to the Job Application Agent (v3.2)*\n\n` +
@@ -181,9 +206,6 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
             `• All refresh tokens are strongly encrypted with AES-256-GCM.\n\n` +
             `To accept the terms and activate your account, reply:\n\`/agree\``
         );
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        await sendTelegramMessage(chatId, `❌ Registration failed: ${msg}`);
       }
       return;
     }
@@ -223,7 +245,11 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
   const isAdmin = user.role === 'admin' || (ADMIN_CHAT_ID !== null && chatId === ADMIN_CHAT_ID);
 
   // 4. Admin Command Handling
-  if (command.startsWith('/admin') || (isAdmin && ['/invite', '/users', '/suspend', '/unsuspend', '/limits'].includes(command))) {
+  if (isAdminCommand(command)) {
+    if (!isAdmin) {
+      await sendTelegramMessage(chatId, '⛔ That command is only available to the administrator.');
+      return;
+    }
     await handleAdminCommand(chatId, user.id, command, args);
     return;
   }
@@ -246,10 +272,11 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
 
       const statusMap = countsRows.reduce((acc, r) => ({ ...acc, [r.status]: r.count }), {} as Record<string, number>);
 
+      // Same states the daily cap counts, so "today" matches what authorizeSend enforces.
       const todaySends = (await sql`
         select count(*)::int as count
         from send_attempts
-        where user_id = ${user.id} and state = 'sent'
+        where user_id = ${user.id} and state in ('reserved', 'sending', 'sent', 'send_unknown')
           and (reserved_at at time zone ${settings.timezone})::date = (now() at time zone ${settings.timezone})::date;
       `) as { count: number }[];
 
@@ -262,7 +289,7 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
           `*Send Window:* ${settings.send_window_start}:00 - ${settings.send_window_end}:00 (${settings.timezone})\n` +
           `*Resume Mode:* \`${settings.resume_mode}\`\n\n` +
           `*Queue Counts:*\n` +
-          `• Verified / Ready: ${statusMap['verified'] || statusMap['ready'] || 0}\n` +
+          `• Verified / Ready: ${(statusMap['verified'] ?? 0) + (statusMap['ready'] ?? 0)}\n` +
           `• Total Sent: ${statusMap['sent'] || 0}\n` +
           `• Replied / Interview: ${statusMap['replied'] || 0}\n` +
           `• Link Route Waiting: ${statusMap['link_ready'] || 0}`
@@ -334,31 +361,30 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
         await updateUserSettings(user.id, { dry_run: true });
         await sendTelegramMessage(chatId, '🧪 Dry run enabled. Emails will be simulated.');
       } else if (sub === 'off') {
-        // Enforce safety exit prerequisites
-        const isConfirm = args[1]?.toLowerCase() === 'confirm';
-        if (!isConfirm) {
-          const activeFacts = (await sql`
-            select * from facts_versions where user_id = ${user.id} and status = 'active' limit 1;
-          `) as Array<{ id: number; facts: { years_experience?: number } }>;
+        // Checked with and without `confirm`: confirming must never skip the prerequisites.
+        const activeFacts = (await sql`
+          select * from facts_versions where user_id = ${user.id} and status = 'active' limit 1;
+        `) as Array<{ id: number; facts: { years_experience?: number } }>;
 
-          const hasGmail = user.gmail_status === 'connected';
-          const hasFacts = activeFacts.length > 0;
-          const hasYears = (activeFacts[0]?.facts?.years_experience || 0) > 0;
-          const has5Drafts = settings.dry_run_drafts_shown >= 5;
+        const hasGmail = user.gmail_status === 'connected';
+        const hasFacts = activeFacts.length > 0;
+        const hasYears = (activeFacts[0]?.facts?.years_experience || 0) > 0;
+        const has5Drafts = settings.dry_run_drafts_shown >= 5;
 
-          if (!hasGmail || !hasFacts || !hasYears || !has5Drafts) {
-            await sendTelegramMessage(
-              chatId,
-              `⚠️ *Cannot Exit Dry Run Yet*\n\n` +
-                `Prerequisites remaining:\n` +
-                `• Connected Gmail: ${hasGmail ? '✅' : '❌ (/connect)'}\n` +
-                `• Accepted Master Facts: ${hasFacts ? '✅' : '❌ (/accept)'}\n` +
-                `• Set Experience: ${hasYears ? '✅' : '❌ (/set years N)'}\n` +
-                `• Reviewed >= 5 Drafts: ${has5Drafts ? '✅' : `❌ (${settings.dry_run_drafts_shown}/5 shown)`}`
-            );
-            return;
-          }
+        if (!hasGmail || !hasFacts || !hasYears || !has5Drafts) {
+          await sendTelegramMessage(
+            chatId,
+            `⚠️ *Cannot Exit Dry Run Yet*\n\n` +
+              `Prerequisites remaining:\n` +
+              `• Connected Gmail: ${hasGmail ? '✅' : '❌ (/connect)'}\n` +
+              `• Accepted Master Facts: ${hasFacts ? '✅' : '❌ (/accept)'}\n` +
+              `• Set Experience: ${hasYears ? '✅' : '❌ (/set years N)'}\n` +
+              `• Reviewed >= 5 Drafts: ${has5Drafts ? '✅' : `❌ (${settings.dry_run_drafts_shown}/5 shown)`}`
+          );
+          return;
+        }
 
+        if (args[1]?.toLowerCase() !== 'confirm') {
           await sendTelegramMessage(
             chatId,
             `⚠️ *Ready to go live at Stage 1 (3 sends/day)?*\nConfirm by typing:\n\`/dry off confirm\``
@@ -387,7 +413,8 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
     }
 
     case '/timezone': {
-      const tz = args[0];
+      // An unknown zone would make every send query for this user throw, so only known zones are stored.
+      const tz = args[0] ? canonicalTimeZone(args[0]) : null;
       if (!tz) {
         await sendTelegramMessage(chatId, 'Usage: `/timezone <IANA-zone>` (e.g. `/timezone Africa/Lagos`, `America/New_York`)');
         return;
@@ -805,7 +832,9 @@ async function handleAdminCommand(
   command: string,
   args: string[]
 ): Promise<void> {
-  switch (command) {
+  // `/admin pauseall` arrives as command '/admin' with args ['pauseall']; Telegram's menu sends `/admin_pauseall`.
+  const action = command === '/admin' ? `/admin_${args[0]?.toLowerCase() ?? ''}` : command;
+  switch (action) {
     case '/invite': {
       const code = await createInvite(adminUserId, 1);
       await sendTelegramMessage(chatId, `🎫 *New Invite Code Created:*\n\`${code}\`\n\nSend this code to the candidate.`);
@@ -848,14 +877,12 @@ async function handleAdminCommand(
       break;
     }
 
-    case '/admin pauseall':
     case '/admin_pauseall': {
       await sql`update global_settings set value = 'true' where key = 'global_paused';`;
       await sendTelegramMessage(chatId, '🚨 *GLOBAL EMERGENCY PAUSE ACTIVATED!* All sends halted.');
       break;
     }
 
-    case '/admin resumeall':
     case '/admin_resumeall': {
       await sql`update global_settings set value = 'false' where key = 'global_paused';`;
       await sendTelegramMessage(chatId, '▶️ *Global Pause Cleared.* System resumed.');

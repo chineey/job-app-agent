@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import { after, afterEach, before, beforeEach, describe, it } from 'node:test';
 import {
-  holdSendStateLock,
+  holdRowLock,
   resetDatabase,
   runSendCron,
   seedApplication,
@@ -55,7 +55,7 @@ afterEach(async (t) => {
   const { rows: applications } = await db.pool.query(
     'select id, status, attempts, gmail_message_id from applications order by created_at'
   );
-  writeEvidence(t.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, ''), {
+  writeEvidence('send-safety', t.name, {
     scenario: t.name,
     ...evidence,
     final: { attempts, applications },
@@ -65,6 +65,10 @@ afterEach(async (t) => {
     serverLogTail: app.log.slice(-40).join(''),
   });
 });
+
+function holdSendStateLock(userId: string) {
+  return holdRowLock(db, 'select 1 from send_state where user_id = $1 for update', [userId]);
+}
 
 async function attemptsFor(userId: string): Promise<Array<{ id: string; state: string; application_id: string }>> {
   const { rows } = await db.pool.query(
@@ -97,7 +101,7 @@ describe('send safety', () => {
     const first = await seedApplication(db, userId, { recipient: 'jobs@first.test' });
 
     // Both workers must reach authorization while each holds a different application.
-    const gate = await holdSendStateLock(db, userId);
+    const gate = await holdSendStateLock(userId);
     const workerA = runSendCron();
     await waitForClaim(first);
     const second = await seedApplication(db, userId, { recipient: 'jobs@second.test' });
@@ -126,7 +130,7 @@ describe('send safety', () => {
     const userId = await seedUser(db, { chatId: 1001, cap: 3 });
     const applicationId = await seedApplication(db, userId, { recipient: 'jobs@stale.test' });
 
-    const gate = await holdSendStateLock(db, userId);
+    const gate = await holdSendStateLock(userId);
     const staleWorker = runSendCron();
     const staleToken = await waitForClaim(applicationId);
     // The stale worker's lease expires while it waits; a second worker reclaims the row.
