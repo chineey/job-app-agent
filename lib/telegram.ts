@@ -19,6 +19,9 @@ import { MasterFacts } from './schemas';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID ? parseInt(process.env.ADMIN_CHAT_ID, 10) : null;
 const APP_BASE_URL = process.env.APP_BASE_URL || 'http://localhost:3000';
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+// E2E only: point Bot API calls at a fake server. Unset in every real environment.
+const TELEGRAM_API_BASE_URL = process.env.TELEGRAM_API_BASE_URL || 'https://api.telegram.org';
 
 /**
  * Sends a text message to a Telegram chat.
@@ -34,8 +37,11 @@ export async function sendTelegramMessage(
   }
 
   try {
-    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    // Next 14 caches fetch() inside GET route handlers (every cron), POSTs included.
+    // A cached reply means the message is silently never sent.
+    const res = await fetch(`${TELEGRAM_API_BASE_URL}/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
+      cache: 'no-store',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         chat_id: chatId,
@@ -74,8 +80,9 @@ export async function sendTelegramDocument(
       formData.append('parse_mode', 'Markdown');
     }
 
-    const res = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`, {
+    const res = await fetch(`${TELEGRAM_API_BASE_URL}/bot${TELEGRAM_BOT_TOKEN}/sendDocument`, {
       method: 'POST',
+      cache: 'no-store',
       body: formData,
     });
     return res.ok;
@@ -392,12 +399,12 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
 
     case '/resolve': {
       const attemptId = args[0];
-      const action = args[1]?.toLowerCase() as 'sent' | 'notsent';
-      if (!attemptId || !['sent', 'notsent'].includes(action)) {
+      const action = args[1]?.toLowerCase();
+      if (!attemptId || !UUID_PATTERN.test(attemptId) || (action !== 'sent' && action !== 'notsent')) {
         await sendTelegramMessage(chatId, 'Usage: `/resolve <attempt_id> sent|notsent`');
         return;
       }
-      const res = await resolveSendAttempt(attemptId, action, 'user');
+      const res = await resolveSendAttempt(user.id, attemptId, action, 'user');
       await sendTelegramMessage(chatId, res.message);
       break;
     }
@@ -706,14 +713,14 @@ export async function handleTelegramDocument(
 
   try {
     // 1. Get file path from Telegram
-    const fileRes = await fetch(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${document.file_id}`);
+    const fileRes = await fetch(`${TELEGRAM_API_BASE_URL}/bot${TELEGRAM_BOT_TOKEN}/getFile?file_id=${document.file_id}`);
     const fileData = await fileRes.json();
     if (!fileData.ok || !fileData.result?.file_path) {
       throw new Error('Failed to retrieve file location from Telegram.');
     }
 
     // 2. Download file buffer
-    const downloadRes = await fetch(`https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${fileData.result.file_path}`);
+    const downloadRes = await fetch(`${TELEGRAM_API_BASE_URL}/file/bot${TELEGRAM_BOT_TOKEN}/${fileData.result.file_path}`);
     const arrayBuf = await downloadRes.arrayBuffer();
     const buffer = Buffer.from(arrayBuf);
 

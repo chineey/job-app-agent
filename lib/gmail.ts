@@ -1,23 +1,40 @@
-import { google, gmail_v1 } from 'googleapis';
+import { google, gmail_v1, Auth } from 'googleapis';
 import { decryptToken } from './crypto';
 import { getUserById } from './users';
 
 const GMAIL_CLIENT_ID = process.env.GMAIL_CLIENT_ID || '';
 const GMAIL_CLIENT_SECRET = process.env.GMAIL_CLIENT_SECRET || '';
 const GOOGLE_REDIRECT_URI = process.env.GOOGLE_REDIRECT_URI || `${process.env.APP_BASE_URL || 'http://localhost:3000'}/api/oauth/gmail/callback`;
+// E2E only: point Google calls at a fake server. Unset in every real environment.
+const GOOGLE_API_ROOT_URL = process.env.GOOGLE_API_ROOT_URL;
+const GOOGLE_OAUTH_TOKEN_URL = process.env.GOOGLE_OAUTH_TOKEN_URL;
 
 export function getOAuth2Client() {
-  return new google.auth.OAuth2(
-    GMAIL_CLIENT_ID,
-    GMAIL_CLIENT_SECRET,
-    GOOGLE_REDIRECT_URI
-  );
+  return new google.auth.OAuth2({
+    clientId: GMAIL_CLIENT_ID,
+    clientSecret: GMAIL_CLIENT_SECRET,
+    redirectUri: GOOGLE_REDIRECT_URI,
+    endpoints: GOOGLE_OAUTH_TOKEN_URL ? { oauth2TokenUrl: GOOGLE_OAUTH_TOKEN_URL } : undefined,
+  });
+}
+
+/**
+ * Returns the HTTP status Google answered with, or null when no response arrived
+ * (timeout, dropped connection). Only a 4xx proves the request was rejected.
+ */
+export function httpStatusOf(err: unknown): number | null {
+  if (typeof err !== 'object' || err === null || !('response' in err)) return null;
+  const response = err.response;
+  if (typeof response !== 'object' || response === null || !('status' in response)) return null;
+  return typeof response.status === 'number' ? response.status : null;
 }
 
 /**
  * Instantiates an authenticated Gmail API client for a given user.
  */
-export async function getGmailClientForUser(userId: string): Promise<{ gmail: gmail_v1.Gmail; userEmail: string }> {
+export async function getGmailClientForUser(
+  userId: string
+): Promise<{ gmail: gmail_v1.Gmail; auth: Auth.OAuth2Client; userEmail: string }> {
   const user = await getUserById(userId);
   if (!user) {
     throw new Error(`User not found: ${userId}`);
@@ -33,8 +50,8 @@ export async function getGmailClientForUser(userId: string): Promise<{ gmail: gm
     refresh_token: refreshToken,
   });
 
-  const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-  return { gmail, userEmail: user.gmail_address || '' };
+  const gmail = google.gmail({ version: 'v1', auth: oauth2Client, rootUrl: GOOGLE_API_ROOT_URL });
+  return { gmail, auth: oauth2Client, userEmail: user.gmail_address || '' };
 }
 
 /**
@@ -114,12 +131,16 @@ export async function sendGmailRawMessage(
   rawMime: string
 ): Promise<{ id: string; threadId: string }> {
   const rawBase64Url = encodeBase64Url(rawMime);
-  const res = await gmail.users.messages.send({
-    userId: 'me',
-    requestBody: {
-      raw: rawBase64Url,
+  // A retried POST could deliver the same email twice, so the HTTP client must never retry it.
+  const res = await gmail.users.messages.send(
+    {
+      userId: 'me',
+      requestBody: {
+        raw: rawBase64Url,
+      },
     },
-  });
+    { retry: false }
+  );
 
   if (!res.data.id || !res.data.threadId) {
     throw new Error('Gmail API send returned no message ID or thread ID.');

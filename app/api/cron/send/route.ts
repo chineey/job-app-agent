@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { authorizeCronRequest, unauthorizedResponse } from '@/lib/auth';
 import { claimApplications } from '@/lib/claims';
-import { reconcileUncertainSends, authorizeSend, executeSend } from '@/lib/send';
+import { reconcileUncertainSends, authorizeSend, executeSend, type SendOutcome } from '@/lib/send';
 
 export const dynamic = 'force-dynamic';
+// Every outbound call here is a side effect or must be fresh; never serve one from Next's fetch cache.
+export const fetchCache = 'force-no-store';
 export const maxDuration = 60; // Up to 60 seconds
 
 export async function GET(req: NextRequest) {
@@ -16,46 +18,37 @@ export async function GET(req: NextRequest) {
     const reconcileResults = await reconcileUncertainSends();
 
     // 2. Claim verified or ready applications across users fairly
-    // Pick up to 5 applications per user, up to 15 total
     const verifiedApps = await claimApplications('verified', 15, 3, 'send_worker');
     const readyApps = await claimApplications('ready', 15, 3, 'send_worker');
     const allApps = [...verifiedApps, ...readyApps];
 
-    let authorizedCount = 0;
-    let sentCount = 0;
     let dryRunCount = 0;
     let skippedCount = 0;
+    const outcomes: Record<SendOutcome, number> = { sent: 0, failed: 0, released: 0, send_unknown: 0, aborted: 0 };
 
     for (const app of allApps) {
       if (!app.claim_token) continue;
 
-      const authRes = await authorizeSend(app.user_id, app.id, app.claim_token);
-
-      if (authRes.isDryRun) {
+      const authorization = await authorizeSend(app.user_id, app.id, app.claim_token);
+      if (authorization.outcome === 'dry_run') {
         dryRunCount++;
         continue;
       }
-
-      if (!authRes.authorized || !authRes.attemptId) {
+      if (authorization.outcome === 'skipped') {
         skippedCount++;
         continue;
       }
 
-      authorizedCount++;
-      const sendRes = await executeSend(app.user_id, authRes.attemptId);
-      if (sendRes.success) {
-        sentCount++;
-      }
+      outcomes[await executeSend(app.user_id, authorization.attemptId)]++;
     }
 
     return NextResponse.json({
       ok: true,
       reconciliation: reconcileResults,
       claimed: allApps.length,
-      authorized: authorizedCount,
-      sent: sentCount,
       dryRuns: dryRunCount,
       skipped: skippedCount,
+      ...outcomes,
     });
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : String(err);

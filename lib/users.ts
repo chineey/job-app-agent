@@ -1,5 +1,6 @@
 import crypto from 'crypto';
-import { sql, logEvent, assertUserScope } from './db';
+import { escapeIdentifier } from 'pg';
+import { sql, query, logEvent, assertUserScope } from './db';
 
 export interface UserRecord {
   id: string;
@@ -212,14 +213,10 @@ export async function updateUserSettings(
 ): Promise<void> {
   assertUserScope(userId);
 
-  // Apply updates safely
+  // Column names cannot be bind parameters, so each one is quoted as an identifier.
   for (const [key, val] of Object.entries(updates)) {
     if (val !== undefined) {
-      await sql`
-        update user_settings
-        set ${sql(key)} = ${val}
-        where user_id = ${userId};
-      `;
+      await query(`update user_settings set ${escapeIdentifier(key)} = $1 where user_id = $2`, [val, userId]);
     }
   }
 }
