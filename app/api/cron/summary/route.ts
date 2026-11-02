@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { authorizeCronRequest, unauthorizedResponse } from '@/lib/auth';
 import { sql } from '@/lib/db';
-import { evaluateRampProgression, getUserSettings } from '@/lib/users';
+import { evaluateRampProgression } from '@/lib/ramp';
 import { sendTelegramMessage } from '@/lib/telegram';
 
 export const dynamic = 'force-dynamic';

@@ -23,6 +23,8 @@ const CRON_SECRET = 'e2e-cron-secret';
 const WEBHOOK_SECRET = 'e2e-webhook-secret';
 const BOT_TOKEN = 'e2e-bot-token';
 export const ADMIN_CHAT_ID = 1;
+/** Daily cap per ramp stage, as in lib/ramp.ts. */
+export const RAMP_STAGE_CAPS = [0, 3, 5, 10, 15, 20];
 const ENCRYPTION_KEY = crypto.randomBytes(32);
 export const RESUME_URL = `${FAKE_URL}/resume.pdf`;
 
@@ -100,11 +102,13 @@ export async function seedUser(db: Database, options: { chatId: number; cap: num
     [options.chatId, `Synthetic ${options.chatId}`, `candidate${options.chatId}@gmail.com`, encryptRefreshToken(seededRefreshToken(options.chatId))]
   );
   const userId = rows[0].id;
-  // A 0-24 window keeps the window check open whenever the suite runs.
+  // A live user on the lowest ramp stage that allows `cap`; a 0-24 window keeps the window check open.
+  const rampStage = RAMP_STAGE_CAPS.findIndex((stageCap) => stageCap >= options.cap);
+  if (rampStage < 1) throw new Error(`No ramp stage allows a cap of ${options.cap}`);
   await db.pool.query(
-    `insert into user_settings (user_id, dry_run, paused, current_cap, timezone, send_window_start, send_window_end)
-     values ($1, false, false, $2, 'UTC', 0, 24)`,
-    [userId, options.cap]
+    `insert into user_settings (user_id, dry_run, paused, ramp_stage, ramp_stage_started_at, current_cap, timezone, send_window_start, send_window_end)
+     values ($1, false, false, $2, now(), $3, 'UTC', 0, 24)`,
+    [userId, rampStage, options.cap]
   );
   await db.pool.query(`insert into send_state (user_id, next_send_at) values ($1, now() - interval '1 hour')`, [userId]);
   return userId;
@@ -191,7 +195,7 @@ export async function waitFor(description: string, check: () => Promise<boolean>
 
 // ---------------------------------------------------------------- Fake Google and Telegram
 
-export type SendBehavior = 'accept' | 'accept_then_503' | 'accept_then_hang' | 'reject_400';
+export type SendBehavior = 'accept' | 'accept_then_503' | 'accept_then_hang' | 'reject_400' | 'reject_403';
 
 export interface GmailMessage {
   id: string;
@@ -223,6 +227,8 @@ export interface FakeProviders {
   sendRequests: number;
   /** Messages Gmail stored in the Sent folder. */
   sent: GmailMessage[];
+  /** Bounce notices (from mailer-daemon) in the inbox. */
+  bounces: Array<{ id: string; threadId: string; snippet: string }>;
   // chat_id arrives as a string when it was read from the bigint column, as a number otherwise.
   telegram: Array<{ chatId: number | string; text: string }>;
   unexpected: string[];
@@ -239,6 +245,7 @@ export async function startFakeProviders(): Promise<FakeProviders> {
     revokedTokens: [],
     sendRequests: 0,
     sent: [],
+    bounces: [],
     telegram: [],
     unexpected: [],
     sendBehavior: 'accept',
@@ -247,6 +254,7 @@ export async function startFakeProviders(): Promise<FakeProviders> {
       state.revokedTokens = [];
       state.sendRequests = 0;
       state.sent = [];
+      state.bounces = [];
       state.telegram = [];
       state.unexpected = [];
       state.sendBehavior = 'accept';
@@ -290,6 +298,9 @@ export async function startFakeProviders(): Promise<FakeProviders> {
       if (state.sendBehavior === 'reject_400') {
         return json(res, 400, { error: { code: 400, message: 'Invalid To header', status: 'INVALID_ARGUMENT' } });
       }
+      if (state.sendBehavior === 'reject_403') {
+        return json(res, 403, { error: { code: 403, message: 'Daily user sending limit exceeded', status: 'PERMISSION_DENIED' } });
+      }
       const raw = Buffer.from(JSON.parse(body).raw, 'base64url').toString('utf8');
       const message: GmailMessage = {
         id: `msg-${state.sent.length + 1}`,
@@ -315,6 +326,12 @@ export async function startFakeProviders(): Promise<FakeProviders> {
     }
 
     if (req.method === 'GET' && url.pathname === '/gmail/v1/users/me/messages') {
+      if ((url.searchParams.get('q') ?? '').includes('from:mailer-daemon')) {
+        return json(res, 200, {
+          messages: state.bounces.map((b) => ({ id: b.id, threadId: b.threadId })),
+          resultSizeEstimate: state.bounces.length,
+        });
+      }
       const wanted = /rfc822msgid:(\S+)/.exec(url.searchParams.get('q') ?? '')?.[1];
       const found = state.sent.filter((m) => m.rfcMessageId === wanted);
       return json(res, 200, {
@@ -325,6 +342,8 @@ export async function startFakeProviders(): Promise<FakeProviders> {
 
     const messageMatch = /^\/gmail\/v1\/users\/me\/messages\/([^/]+)$/.exec(url.pathname);
     if (req.method === 'GET' && messageMatch) {
+      const bounce = state.bounces.find((b) => b.id === messageMatch[1]);
+      if (bounce) return json(res, 200, { id: bounce.id, threadId: bounce.threadId, snippet: bounce.snippet });
       const message = state.sent.find((m) => m.id === messageMatch[1]);
       if (!message) return json(res, 404, { error: { code: 404, message: 'Not found' } });
       return json(res, 200, { id: message.id, threadId: message.threadId, internalDate: message.internalDate });
@@ -438,13 +457,17 @@ export async function getApp(pathAndQuery: string, headers: Record<string, strin
   return fetch(`${APP_URL}${pathAndQuery}`, { headers, redirect: 'manual' });
 }
 
-export async function runSendCron(): Promise<Record<string, unknown>> {
-  const res = await fetch(`${APP_URL}/api/cron/send`, { headers: { authorization: `Bearer ${CRON_SECRET}` } });
+export async function runCron(name: 'send' | 'summary' | 'inbox'): Promise<Record<string, unknown>> {
+  const res = await fetch(`${APP_URL}/api/cron/${name}`, { headers: { authorization: `Bearer ${CRON_SECRET}` } });
   const body = (await res.json()) as Record<string, unknown>;
   if (res.status !== 200) {
-    throw new Error(`Send cron answered ${res.status}: ${JSON.stringify(body)}`);
+    throw new Error(`${name} cron answered ${res.status}: ${JSON.stringify(body)}`);
   }
   return body;
+}
+
+export function runSendCron(): Promise<Record<string, unknown>> {
+  return runCron('send');
 }
 
 let nextUpdateId = 1;

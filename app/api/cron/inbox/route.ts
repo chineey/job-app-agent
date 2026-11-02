@@ -3,7 +3,8 @@ import { authorizeCronRequest, unauthorizedResponse } from '@/lib/auth';
 import { sql, logEvent } from '@/lib/db';
 import { getGmailClientForUser, searchBounces, getThreadInboundMessages, createGmailDraft } from '@/lib/gmail';
 import { classifyRecruiterReply, generateReplyDraft } from '@/lib/gemini';
-import { autoPauseUser, getUserSettings } from '@/lib/users';
+import { getUserSettings } from '@/lib/users';
+import { pauseOnHighBounceRate } from '@/lib/ramp';
 import { sendTelegramMessage } from '@/lib/telegram';
 import { MasterFacts } from '@/lib/schemas';
 
@@ -49,31 +50,11 @@ export async function GET(req: NextRequest) {
             totalBouncesFound += matchRows.length;
             await logEvent(user.id, 'application_bounced', { bounceId: b.id, snippet: b.snippet });
 
-            // Check bounce rate for auto-pause (over last 20 sends)
-            const recentSends = (await sql`
-              select status from applications
-              where user_id = ${user.id} and applied_at is not null
-              order by applied_at desc limit 20;
-            `) as Array<{ status: string }>;
-
-            const bouncedCount = recentSends.filter((s) => s.status === 'bounced').length;
-            const bounceRate = recentSends.length > 0 ? (bouncedCount / recentSends.length) * 100 : 0;
-
-            if (bounceRate > 5 && recentSends.length >= 10) {
-              await autoPauseUser(user.id, `Elevated bounce rate (${Math.round(bounceRate)}%)`);
-              if (user.telegram_chat_id) {
-                await sendTelegramMessage(
-                  user.telegram_chat_id,
-                  `🚨 *Auto-Pause Activated: High Bounce Rate*\n\n` +
-                    `Your recent bounce rate reached ${Math.round(bounceRate)}%. Sends are temporarily paused to protect your email domain reputation.`
-                );
-              }
-            } else if (user.telegram_chat_id) {
-              await sendTelegramMessage(
-                user.telegram_chat_id,
-                `⚠️ *Delivery Bounce Detected*\nAn application to \`${matchRows[0].contact_email}\` bounced.`
-              );
-            }
+            await sendTelegramMessage(
+              user.telegram_chat_id,
+              `⚠️ *Delivery Bounce Detected*\nAn application to \`${matchRows[0].contact_email}\` bounced.`
+            );
+            await pauseOnHighBounceRate(user.id);
           }
         }
 

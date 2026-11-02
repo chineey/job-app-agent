@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import type { gmail_v1 } from 'googleapis';
 import { sql, withTransaction, logEvent, assertUserScope } from './db';
-import { autoPauseUser } from './users';
+import { autoPause, pauseAfterConsecutiveFailures, sendCap } from './ramp';
 import {
   getGmailClientForUser,
   buildMimeMessage,
@@ -137,7 +137,7 @@ export async function authorizeSend(
     const [account] = (await tx`
       select u.status, u.gmail_status, u.gmail_address, u.telegram_chat_id,
              s.paused, s.dry_run, s.timezone, s.send_window_start, s.send_window_end,
-             s.current_cap, s.resume_mode
+             s.ramp_stage, s.current_cap, s.max_cap, s.resume_mode
       from users u
       join user_settings s on s.user_id = u.id
       where u.id = ${userId}
@@ -151,7 +151,9 @@ export async function authorizeSend(
       timezone: string;
       send_window_start: number;
       send_window_end: number;
+      ramp_stage: number;
       current_cap: number;
+      max_cap: number;
       resume_mode: string;
     }>;
     if (!account || account.status !== 'active' || account.gmail_status !== 'connected' || account.paused) {
@@ -207,23 +209,16 @@ export async function authorizeSend(
     const recipient = app.contact_email;
     const recipientDomain = extractDomain(recipient);
 
-    // Today in the candidate's timezone. Failed and released attempts do not use a slot.
-    const [today] = (await tx`
-      select (count(*))::int as total,
-             (count(*) filter (where recipient_domain = ${recipientDomain}))::int as to_domain
-      from send_attempts
-      where user_id = ${userId}
-        and state in ('reserved', 'sending', 'sent', 'send_unknown')
-        and (reserved_at at time zone ${account.timezone})::date = (now() at time zone ${account.timezone})::date
-    `) as Array<{ total: number; to_domain: number }>;
-    if (today.total >= account.current_cap) {
-      return { outcome: 'skipped', reason: `Daily send cap reached (${account.current_cap}).` };
-    }
-    if (today.to_domain >= DOMAIN_DAILY_LIMIT) {
-      return { outcome: 'skipped', reason: `Daily domain limit reached for ${recipientDomain} (max ${DOMAIN_DAILY_LIMIT}).` };
-    }
-
     if (account.dry_run) {
+      // Each application is previewed once, so the 5-preview gate counts distinct drafts.
+      const firstPreview = await tx`
+        update applications set dry_run_previewed_at = now()
+        where id = ${app.id} and dry_run_previewed_at is null
+        returning id
+      `;
+      if (firstPreview.length === 0) {
+        return { outcome: 'skipped', reason: 'Already previewed in dry run.' };
+      }
       await tx`update user_settings set dry_run_drafts_shown = dry_run_drafts_shown + 1 where user_id = ${userId}`;
       return {
         outcome: 'dry_run',
@@ -236,6 +231,23 @@ export async function authorizeSend(
           body: app.email_body || '(No body content)',
         },
       };
+    }
+
+    // Today in the candidate's timezone. Failed and released attempts do not use a slot.
+    const [today] = (await tx`
+      select (count(*))::int as total,
+             (count(*) filter (where recipient_domain = ${recipientDomain}))::int as to_domain
+      from send_attempts
+      where user_id = ${userId}
+        and state in ('reserved', 'sending', 'sent', 'send_unknown')
+        and (reserved_at at time zone ${account.timezone})::date = (now() at time zone ${account.timezone})::date
+    `) as Array<{ total: number; to_domain: number }>;
+    const cap = sendCap(account);
+    if (today.total >= cap) {
+      return { outcome: 'skipped', reason: `Daily send cap reached (${cap}).` };
+    }
+    if (today.to_domain >= DOMAIN_DAILY_LIMIT) {
+      return { outcome: 'skipped', reason: `Daily domain limit reached for ${recipientDomain} (max ${DOMAIN_DAILY_LIMIT}).` };
     }
 
     const rfcMessageId = generateRfcMessageId(extractDomain(account.gmail_address ?? '') || undefined);
@@ -380,6 +392,8 @@ export async function executeSend(userId: string, attemptId: string): Promise<Se
       await recordConfirmedFailure(attempt, `Gmail rejected the message (${status}): ${errorMessage(err)}`, 'sending');
       if (status === 401) {
         await handleGmailAuthLoss(attempt);
+      } else if (status === 403) {
+        await autoPause(userId, 'Gmail refused to send (403). This usually means a sending limit or a problem with the account.');
       }
       return 'failed';
     }
@@ -504,6 +518,7 @@ async function recordConfirmedFailure(
     return;
   }
   await logEvent(attempt.user_id, 'send_attempt_confirmed_failure', { attemptId: attempt.id, error }, null, attempt.application_id);
+  await pauseAfterConsecutiveFailures(attempt.user_id);
 }
 
 /** Frees a reserved slot that never reached Gmail, without counting it as a failure. */
@@ -551,11 +566,7 @@ async function recordUncertain(attempt: AttemptRef, error: string): Promise<void
 
 async function handleGmailAuthLoss(attempt: AttemptRef): Promise<void> {
   await sql`update users set gmail_status = 'error' where id = ${attempt.user_id}`;
-  await autoPauseUser(attempt.user_id, 'Gmail authentication revoked or invalid');
-  await sendTelegramMessage(
-    attempt.telegram_chat_id,
-    `⚠️ *Gmail access lost.* Sending is paused. Reconnect with \`/connect\`, then \`/resume\`.`
-  );
+  await autoPause(attempt.user_id, 'Gmail access was revoked or has expired. Reconnect with `/connect` before resuming.');
 }
 
 /**

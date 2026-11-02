@@ -268,3 +268,6 @@ create table if not exists telegram_updates (
 -- would get each user's full allowance.
 create unique index if not exists users_gmail_address_unique
   on users (lower(gmail_address)) where gmail_address is not null;
+
+-- Set when a dry-run preview of the application is shown, so each one is previewed (and counted) once.
+alter table applications add column if not exists dry_run_previewed_at timestamptz;

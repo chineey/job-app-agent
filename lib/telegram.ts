@@ -12,6 +12,7 @@ import {
   deleteUserAccount,
 } from './users';
 import { resolveSendAttempt } from './send';
+import { capCeiling, sendCap, stageCap } from './ramp';
 import { disconnectGmail, type DisconnectResult } from './gmail';
 import { validateUploadedPdf, extractResumeText, parseResumeTextToFacts } from './parse-resume';
 import { mergeWithActiveFacts, computeFactsDiff } from './facts';
@@ -299,7 +300,7 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
         `📊 *Your Status Overview*\n\n` +
           `*Gmail:* \`${user.gmail_status}\` (${user.gmail_address || 'not connected'})\n` +
           `*Ramp Stage:* \`${settings.ramp_stage}\` | *Dry Run:* \`${settings.dry_run ? 'ON' : 'OFF'}\`\n` +
-          `*Today's Sends:* ${todaySends[0].count} / ${settings.current_cap} (Max: ${settings.max_cap})\n` +
+          `*Today's Sends:* ${todaySends[0].count} / ${settings.dry_run ? 0 : sendCap(settings)}\n` +
           `*Send Window:* ${settings.send_window_start}:00 - ${settings.send_window_end}:00 (${settings.timezone})\n` +
           `*Resume Mode:* \`${settings.resume_mode}\`\n\n` +
           `*Queue Counts:*\n` +
@@ -347,13 +348,18 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
     }
 
     case '/cap': {
+      // The ramp stage sets the ceiling: /cap can lower the daily cap, never skip the ramp.
+      const ceiling = capCeiling(settings);
       const capVal = parseInt(args[0], 10);
       if (isNaN(capVal) || capVal < 1) {
-        await sendTelegramMessage(chatId, `Usage: \`/cap <number>\` (Current: ${settings.current_cap}, Max: ${settings.max_cap})`);
+        await sendTelegramMessage(chatId, `Usage: \`/cap <number>\` (Current: ${settings.current_cap}, Max now: ${ceiling})`);
         return;
       }
-      if (capVal > settings.max_cap) {
-        await sendTelegramMessage(chatId, `❌ Cap cannot exceed your account ceiling of ${settings.max_cap}.`);
+      if (capVal > ceiling) {
+        await sendTelegramMessage(
+          chatId,
+          `❌ At ramp stage ${settings.ramp_stage} your cap can be at most ${ceiling}. It rises as you move up the ramp.`
+        );
         return;
       }
       await updateUserSettings(user.id, { current_cap: capVal });
@@ -398,7 +404,12 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
           return;
         }
 
-        await updateUserSettings(user.id, { dry_run: false, ramp_stage: 1, current_cap: 3 });
+        await updateUserSettings(user.id, {
+          dry_run: false,
+          ramp_stage: 1,
+          current_cap: Math.min(stageCap(1), settings.max_cap),
+          ramp_stage_started_at: new Date().toISOString(),
+        });
         await sendTelegramMessage(chatId, '🚀 *Live Mode Active!* You are at Stage 1 (3 sends/day).');
       } else {
         await sendTelegramMessage(chatId, 'Usage: `/dry on` or `/dry off`');
