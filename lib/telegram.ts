@@ -110,16 +110,32 @@ export async function sendTelegramDocument(
   }
 }
 
+/** Spec: at most 30 updates per chat per minute. */
+const CHAT_UPDATES_PER_MINUTE = 30;
+
 /**
- * Records a Telegram update id. Returns false if it was already handled (Telegram redelivered it).
+ * Records a Telegram update. 'duplicate' means Telegram redelivered one already handled;
+ * 'rate_limited' means the chat sent more than the per-minute limit and is ignored, without a reply.
  */
-export async function claimTelegramUpdate(updateId: number): Promise<boolean> {
+export async function claimTelegramUpdate(updateId: number, chatId: number): Promise<'new' | 'duplicate' | 'rate_limited'> {
   const rows = await sql`
-    insert into telegram_updates (update_id) values (${updateId})
+    insert into telegram_updates (update_id, chat_id) values (${updateId}, ${chatId})
     on conflict (update_id) do nothing
     returning update_id
   `;
-  return rows.length > 0;
+  if (rows.length === 0) return 'duplicate';
+
+  const [recent] = (await sql`
+    select count(*)::int as count from telegram_updates
+    where chat_id = ${chatId} and received_at > now() - interval '1 minute'
+  `) as Array<{ count: number }>;
+  return recent.count > CHAT_UPDATES_PER_MINUTE ? 'rate_limited' : 'new';
+}
+
+/** Telegram redelivers for at most a day, so older update ids are no longer needed. */
+export async function pruneTelegramUpdates(): Promise<number> {
+  const deleted = await sql`delete from telegram_updates where received_at < now() - interval '1 day' returning update_id`;
+  return deleted.length;
 }
 
 function disconnectMessage(result: DisconnectResult): string {

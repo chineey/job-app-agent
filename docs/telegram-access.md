@@ -27,11 +27,12 @@ The Telegram webhook is the only way users and the admin control the agent. This
 | 8 | User sets `/timezone Mars/Olympus` | Stored as is; every later send query (`at time zone`) threw, failing the send cron for all users | Rejected unless it is a valid IANA zone; stored in canonical form | Invalid timezone is rejected |
 | 9 | The admin has no account yet | `/start` required an invite, and only an admin can create one, so the first admin could never register | `/start` from `ADMIN_CHAT_ID` creates the admin without an invite | Onboarding flow |
 | 10 | Unexpected registration error | `err.message` (database text) was sent to the user | Generic reply; details go to the server log | Not exercised |
+| 11 | One chat floods the bot | Every update was handled | Over 30 updates a minute per chat are ignored without a reply | Throttled chat |
+| 12 | `telegram_updates` grows forever | Nothing pruned it | The hourly summary cron deletes ids older than a day (Telegram redelivers for at most a day) | Pruning |
+| 13 | `/delete_me` | Kept the user's events | Deletes them, and the chat's update ids | `/delete_me` deletes events |
 
 ## Known gaps, not addressed here
 
-- Per-chat rate limiting (spec: 30 requests per minute).
-- `telegram_updates` grows by one small row per update; nothing prunes it yet. Telegram only redelivers within 24 hours, so rows older than a day can be deleted.
 - The failing webhook secret check with no secret configured is not exercised: the E2E server always has one.
 
 ## Proof the suite detects these bugs

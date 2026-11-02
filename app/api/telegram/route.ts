@@ -17,11 +17,12 @@ export async function POST(req: NextRequest) {
     if (typeof update.update_id !== 'number' || message?.chat?.type !== 'private') {
       return NextResponse.json({ ok: true });
     }
-    if (!(await claimTelegramUpdate(update.update_id))) {
-      return NextResponse.json({ ok: true, duplicate: true });
+    const chatId: number = message.chat.id;
+    const claim = await claimTelegramUpdate(update.update_id, chatId);
+    if (claim !== 'new') {
+      return NextResponse.json({ ok: true, ignored: claim });
     }
 
-    const chatId: number = message.chat.id;
     const username = message.from?.username;
     const displayName = `${message.from?.first_name || ''} ${message.from?.last_name || ''}`.trim();
 

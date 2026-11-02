@@ -2,9 +2,11 @@ import { NextRequest, NextResponse } from 'next/server';
 import { authorizeCronRequest, unauthorizedResponse } from '@/lib/auth';
 import { sql } from '@/lib/db';
 import { evaluateRampProgression } from '@/lib/ramp';
-import { sendTelegramMessage } from '@/lib/telegram';
+import { pruneTelegramUpdates, sendTelegramMessage } from '@/lib/telegram';
 
 export const dynamic = 'force-dynamic';
+// Summaries are Telegram sends; never serve one from Next's fetch cache.
+export const fetchCache = 'force-no-store';
 export const maxDuration = 60;
 
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID ? parseInt(process.env.ADMIN_CHAT_ID, 10) : null;
@@ -125,8 +127,11 @@ export async function GET(req: NextRequest) {
       );
     }
 
+    const prunedTelegramUpdates = await pruneTelegramUpdates();
+
     return NextResponse.json({
       ok: true,
+      prunedTelegramUpdates,
       activeUsers: activeUsers.length,
       summariesSent: userSummariesSent,
       rampPromotions,

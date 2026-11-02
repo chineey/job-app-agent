@@ -281,6 +281,8 @@ export async function deleteUserAccount(userId: string): Promise<void> {
   await sql`delete from user_settings where user_id = ${userId};`;
   await sql`delete from user_spend where user_id = ${userId};`;
   await sql`delete from oauth_states where user_id = ${userId};`;
+  await sql`delete from events where user_id = ${userId};`;
+  await sql`delete from telegram_updates where chat_id = (select telegram_chat_id from users where id = ${userId});`;
 
   await sql`
     update users

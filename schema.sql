@@ -278,3 +278,7 @@ alter table applications add column if not exists last_inbound_message_id text;
 
 -- One deadline reminder per waiting link application.
 alter table applications add column if not exists link_reminded_at timestamptz;
+
+-- Per-chat rate limiting reads recent updates by chat.
+alter table telegram_updates add column if not exists chat_id bigint;
+create index if not exists idx_telegram_updates_chat_received on telegram_updates (chat_id, received_at);

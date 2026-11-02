@@ -9,6 +9,7 @@ import {
   postTelegramUpdate,
   repliesTo,
   resetDatabase,
+  runCron,
   seedUser,
   sendTelegramCommand,
   startApp,
@@ -206,4 +207,44 @@ describe('telegram access', () => {
     assert.equal(await userByChat(2001), undefined);
     assert.equal(await inviteUses('SECRET01'), 0);
   });
+
+  it('a chat sending more than 30 updates a minute is throttled', async () => {
+    await seedUser(db, { chatId: 2001, cap: 3 });
+
+    for (let i = 0; i < 35; i++) {
+      assert.equal(await postTelegramUpdate(telegramUpdate(2001, '/status')), 200);
+    }
+
+    assert.equal(repliesTo(fake, 2001).length, 30, 'the five over the limit get no reply and run nothing');
+  });
+
+  it('the summary cron prunes update ids older than a day', async () => {
+    await db.pool.query(
+      `insert into telegram_updates (update_id, chat_id, received_at)
+       values (900001, 2001, now() - interval '2 days'), (900002, 2001, now() - interval '1 hour')`
+    );
+
+    await runCron('summary');
+
+    const { rows } = await db.pool.query('select update_id from telegram_updates order by update_id');
+    assert.deepEqual(rows.map((row) => Number(row.update_id)), [900002]);
+  });
+
+  it('/delete_me deletes the user’s events', async () => {
+    const userId = await seedUser(db, { chatId: 2001, cap: 3 });
+    const otherId = await seedUser(db, { chatId: 2002, cap: 3 });
+    await db.pool.query(
+      `insert into events (user_id, type, detail) values ($1, 'personal', '{}'), ($2, 'personal', '{}')`,
+      [userId, otherId]
+    );
+
+    await sendTelegramCommand(2001, '/delete_me confirm');
+
+    const { rows } = await db.pool.query(
+      `select user_id = $1 as own, type from events where type = 'personal' order by own`,
+      [userId]
+    );
+    assert.deepEqual(rows, [{ own: false, type: 'personal' }], "only the other user's event remains");
+  });
+
 });
