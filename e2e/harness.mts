@@ -255,6 +255,7 @@ export interface FakeProviders {
   telegram: Array<{ chatId: number | string; text: string }>;
   /** Messages the fake Telegram rejected for bad Markdown. */
   telegramRejected: number;
+  telegramDocuments: Array<{ chatId: number; filename: string; caption: string }>;
   unexpected: string[];
   sendBehavior: SendBehavior;
   reset(): void;
@@ -283,6 +284,7 @@ export async function startFakeProviders(): Promise<FakeProviders> {
     bounces: [],
     telegram: [],
     telegramRejected: 0,
+    telegramDocuments: [],
     unexpected: [],
     sendBehavior: 'accept',
     reset() {
@@ -299,6 +301,7 @@ export async function startFakeProviders(): Promise<FakeProviders> {
       state.bounces = [];
       state.telegram = [];
       state.telegramRejected = 0;
+      state.telegramDocuments = [];
       state.unexpected = [];
       state.sendBehavior = 'accept';
     },
@@ -454,6 +457,18 @@ export async function startFakeProviders(): Promise<FakeProviders> {
         return json(res, 400, { ok: false, error_code: 400, description: "Bad Request: can't parse entities" });
       }
       state.telegram.push({ chatId: message.chat_id, text: message.text });
+      return json(res, 200, { ok: true, result: {} });
+    }
+
+    if (req.method === 'POST' && url.pathname === `/bot${BOT_TOKEN}/sendDocument`) {
+      const field = (name: string) => new RegExp(`name="${name}"\\r\\n\\r\\n([\\s\\S]*?)\\r\\n--`).exec(body)?.[1] ?? '';
+      const caption = field('caption');
+      // Like the real Bot API: captions are limited to 1024 characters.
+      if (caption.length > 1024) {
+        return json(res, 400, { ok: false, error_code: 400, description: 'Bad Request: message caption is too long' });
+      }
+      const filename = /filename="([^"]+)"/.exec(body)?.[1] ?? '';
+      state.telegramDocuments.push({ chatId: Number(field('chat_id')), filename, caption });
       return json(res, 200, { ok: true, result: {} });
     }
 

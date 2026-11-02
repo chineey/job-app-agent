@@ -13,6 +13,7 @@ import {
 } from './users';
 import { resolveSendAttempt } from './send';
 import { capCeiling, sendCap, stageCap } from './ramp';
+import { markLinkApplied, waitingLinkApplications } from './links';
 import { disconnectGmail, type DisconnectResult } from './gmail';
 import { validateUploadedPdf, extractResumeText, parseResumeTextToFacts } from './parse-resume';
 import { mergeWithActiveFacts, computeFactsDiff } from './facts';
@@ -100,62 +101,6 @@ export async function sendTelegramDocument(
   } catch (err) {
     console.error(`Failed to send Telegram document to ${chatId}:`, err);
     return false;
-  }
-}
-
-/**
- * Dispatches an interactive card for link/form opportunities with resume PDF.
- */
-export async function dispatchLinkOpportunityCard(
-  chatId: number,
-  params: {
-    applicationId: string;
-    role: string;
-    company: string;
-    location: string;
-    salary?: string;
-    deadline?: string;
-    fitScore: number;
-    gaps: string[];
-    postUrl: string;
-    applyLink: string;
-    coverNote: string;
-    pdfBuffer?: Buffer;
-  }
-): Promise<void> {
-  const isUrgent =
-    params.deadline && (new Date(params.deadline).getTime() - Date.now()) / (1000 * 60 * 60) <= 48;
-  const deadlineHeader = isUrgent ? `🚨 *DEADLINE URGENT:* \`${params.deadline}\`` : `📅 *Deadline:* ${params.deadline || 'None listed'}`;
-
-  const message = [
-    `💼 *New Job Opportunity (Manual Apply)*`,
-    '',
-    `*Role:* ${params.role}`,
-    `*Company:* ${params.company}`,
-    `*Location:* ${params.location || 'Remote'}`,
-    params.salary ? `*Salary:* ${params.salary}` : '',
-    deadlineHeader,
-    `*Fit Score:* ${params.fitScore}/100`,
-    params.gaps.length > 0 ? `*Identified Gaps:* ${params.gaps.join(', ')}` : '',
-    '',
-    `🔗 *Apply Link:* ${params.applyLink}`,
-    `🐦 *Original Post:* ${params.postUrl}`,
-    '',
-    `📝 *Suggested Cover Note:*`,
-    `\`\`\``,
-    params.coverNote || 'I am excited to submit my application for this role.',
-    `\`\`\``,
-    '',
-    `_Apply at the link above, then mark as submitted:_`,
-    `\`/done ${params.applicationId}\``,
-  ]
-    .filter(Boolean)
-    .join('\n');
-
-  if (params.pdfBuffer) {
-    await sendTelegramDocument(chatId, params.pdfBuffer, `${params.company}_Resume.pdf`, message);
-  } else {
-    await sendTelegramMessage(chatId, message);
   }
 }
 
@@ -464,16 +409,27 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
 
     case '/done': {
       const appId = args[0];
-      if (!appId) {
-        await sendTelegramMessage(chatId, 'Usage: `/done <application_id>`');
+      if (!appId || !UUID_PATTERN.test(appId)) {
+        await sendTelegramMessage(chatId, 'Usage: `/done <application_id>` (see `/links`)');
         return;
       }
-      await sql`
-        update applications
-        set status = 'applied_manually', applied_at = now()
-        where id = ${appId} and user_id = ${user.id};
-      `;
-      await sendTelegramMessage(chatId, `✅ Application ${appId} marked as applied manually.`);
+      // Only the user's own waiting link application: an email application must never become "applied manually".
+      const marked = await markLinkApplied(user.id, appId);
+      await sendTelegramMessage(
+        chatId,
+        marked ? `✅ Application ${appId} marked as applied manually.` : 'No waiting link application with that id. See `/links`.'
+      );
+      break;
+    }
+
+    case '/links': {
+      const waiting = await waitingLinkApplications(user.id);
+      const lines = waiting.map(
+        (app) =>
+          `• *${app.role ?? 'Role'}* at ${app.company ?? 'company'} (\`${app.apply_link_domain ?? '?'}\`), ` +
+          `deadline ${app.deadline ?? 'none'}\n  \`/done ${app.id}\``
+      );
+      await sendTelegramMessage(chatId, waiting.length > 0 ? `🔗 *Waiting link applications:*\n\n${lines.join('\n')}` : 'No link applications are waiting.');
       break;
     }
 

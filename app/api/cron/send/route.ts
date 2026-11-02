@@ -2,6 +2,7 @@ import { NextRequest, NextResponse } from 'next/server';
 import { authorizeCronRequest, unauthorizedResponse } from '@/lib/auth';
 import { claimApplications } from '@/lib/claims';
 import { reconcileUncertainSends, authorizeSend, executeSend, type SendOutcome } from '@/lib/send';
+import { dispatchLinkApplications } from '@/lib/links';
 
 export const dynamic = 'force-dynamic';
 // Every outbound call here is a side effect or must be fresh; never serve one from Next's fetch cache.
@@ -16,6 +17,9 @@ export async function GET(req: NextRequest) {
   try {
     // 1. Reconcile any uncertain sends across all users
     const reconcileResults = await reconcileUncertainSends();
+
+    // Link applications are not sent from Gmail; their cards go out on the same schedule.
+    const links = await dispatchLinkApplications();
 
     // 2. Claim verified or ready applications across users fairly
     const verifiedApps = await claimApplications('verified', 15, 3, 'send_worker');
@@ -45,6 +49,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({
       ok: true,
       reconciliation: reconcileResults,
+      links,
       claimed: allApps.length,
       dryRuns: dryRunCount,
       skipped: skippedCount,

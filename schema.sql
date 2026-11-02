@@ -275,3 +275,6 @@ alter table applications add column if not exists dry_run_previewed_at timestamp
 -- Inbox scan bookkeeping: threads are checked in rotation, and each inbound message is handled once.
 alter table applications add column if not exists thread_checked_at timestamptz;
 alter table applications add column if not exists last_inbound_message_id text;
+
+-- One deadline reminder per waiting link application.
+alter table applications add column if not exists link_reminded_at timestamptz;
