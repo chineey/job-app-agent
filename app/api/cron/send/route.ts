@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { authorizeCronRequest, unauthorizedResponse } from '@/lib/auth';
-import { claimApplications } from '@/lib/claims';
-import { reconcileUncertainSends, authorizeSend, executeSend, type SendOutcome } from '@/lib/send';
+import { runSendPass } from '@/lib/send';
 import { dispatchLinkApplications } from '@/lib/links';
 
 export const dynamic = 'force-dynamic';
@@ -15,45 +14,19 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    // 1. Reconcile any uncertain sends across all users
-    const reconcileResults = await reconcileUncertainSends();
-
     // Link applications are not sent from Gmail; their cards go out on the same schedule.
     const links = await dispatchLinkApplications();
-
-    // 2. Claim verified or ready applications across users fairly
-    const verifiedApps = await claimApplications('verified', 15, 3, 'send_worker');
-    const readyApps = await claimApplications('ready', 15, 3, 'send_worker');
-    const allApps = [...verifiedApps, ...readyApps];
-
-    let dryRunCount = 0;
-    let skippedCount = 0;
-    const outcomes: Record<SendOutcome, number> = { sent: 0, failed: 0, released: 0, send_unknown: 0, aborted: 0 };
-
-    for (const app of allApps) {
-      if (!app.claim_token) continue;
-
-      const authorization = await authorizeSend(app.user_id, app.id, app.claim_token);
-      if (authorization.outcome === 'dry_run') {
-        dryRunCount++;
-        continue;
-      }
-      if (authorization.outcome === 'skipped') {
-        skippedCount++;
-        continue;
-      }
-
-      outcomes[await executeSend(app.user_id, authorization.attemptId)]++;
-    }
+    const pass = await runSendPass();
 
     return NextResponse.json({
       ok: true,
-      reconciliation: reconcileResults,
       links,
-      claimed: allApps.length,
-      dryRuns: dryRunCount,
-      skipped: skippedCount,
-      ...outcomes,
+      reconciliation: pass.reconciliation,
+      claimed: pass.claimed,
+      dryRuns: pass.dryRuns,
+      skipped: pass.skipped,
+      errors: pass.errors,
+      ...pass.outcomes,
     });
   } catch (err: unknown) {
     const errorMsg = err instanceof Error ? err.message : String(err);

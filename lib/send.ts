@@ -10,6 +10,7 @@ import {
   httpStatusOf,
 } from './gmail';
 import { sendTelegramMessage } from './telegram';
+import { claimApplications } from './claims';
 
 // See docs/send-safety.md for the invariants this module maintains and how they are tested.
 
@@ -733,4 +734,54 @@ export async function resolveSendAttempt(
   }
   await logEvent(userId, 'send_attempt_resolved', { attemptId, action, resolvedBy }, null, attempt.application_id);
   return { success: true, message: `Attempt ${attemptId} released. Application reset to ready.` };
+}
+
+export interface SendPassResult {
+  reconciliation: Awaited<ReturnType<typeof reconcileUncertainSends>>;
+  claimed: number;
+  dryRuns: number;
+  skipped: number;
+  errors: number;
+  outcomes: Record<SendOutcome, number>;
+}
+
+/**
+ * One pass of the send pipeline for all users: settle uncertain sends, then try every claimed
+ * application under every cap and lock. One application's unexpected error is logged and counted;
+ * it does not stop the others.
+ */
+export async function runSendPass(): Promise<SendPassResult> {
+  const reconciliation = await reconcileUncertainSends();
+
+  // Up to 3 applications per user, 15 in total, from each input status.
+  const verifiedApps = await claimApplications('verified', 15, 3, 'send_worker');
+  const readyApps = await claimApplications('ready', 15, 3, 'send_worker');
+  const claimed = [...verifiedApps, ...readyApps];
+
+  const result: SendPassResult = {
+    reconciliation,
+    claimed: claimed.length,
+    dryRuns: 0,
+    skipped: 0,
+    errors: 0,
+    outcomes: { sent: 0, failed: 0, released: 0, send_unknown: 0, aborted: 0 },
+  };
+
+  for (const app of claimed) {
+    if (!app.claim_token) continue;
+    try {
+      const authorization = await authorizeSend(app.user_id, app.id, app.claim_token);
+      if (authorization.outcome === 'dry_run') {
+        result.dryRuns++;
+      } else if (authorization.outcome === 'skipped') {
+        result.skipped++;
+      } else {
+        result.outcomes[await executeSend(app.user_id, authorization.attemptId)]++;
+      }
+    } catch (err) {
+      result.errors++;
+      console.error(`Send pass error on application ${app.id}:`, err);
+    }
+  }
+  return result;
 }

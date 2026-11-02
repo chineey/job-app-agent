@@ -216,13 +216,41 @@ export async function updateUserSettings(
 /**
  * Suspends or unsuspends a user (Admin only).
  */
-export async function setUserSuspension(userId: string, suspended: boolean): Promise<void> {
+export async function setUserSuspension(userId: string, suspended: boolean): Promise<boolean> {
   assertUserScope(userId);
-  const status = suspended ? 'suspended' : 'active';
-  await sql`
-    update users set status = ${status} where id = ${userId};
+  // Only between active and suspended: never revives a deleted or pending account, never touches the admin.
+  const from = suspended ? 'active' : 'suspended';
+  const to = suspended ? 'suspended' : 'active';
+  const changed = await sql`
+    update users set status = ${to} where id = ${userId} and status = ${from} and role <> 'admin' returning id
   `;
+  if (changed.length === 0) return false;
   await logEvent(userId, suspended ? 'user_suspended' : 'user_unsuspended', {});
+  return true;
+}
+
+/** Highest per-user ceilings the admin may set: the final ramp stage's cap, and the spec's review limit. */
+export const MAX_CAP_CEILING = 20;
+export const MAX_READS_CEILING = 300;
+
+/**
+ * Sets a user's ceilings (admin). The user's current cap and read limit are lowered to fit;
+ * raising a ceiling never raises what the user has chosen. Returns false for an unknown user.
+ */
+export async function setUserLimits(userId: string, maxCap: number, maxReads: number): Promise<boolean> {
+  assertUserScope(userId);
+  const updated = await sql`
+    update user_settings
+    set max_cap = ${maxCap},
+        max_reads_ceiling = ${maxReads},
+        current_cap = least(current_cap, ${maxCap}),
+        daily_read_cap = least(daily_read_cap, ${maxReads})
+    where user_id = ${userId}
+    returning user_id
+  `;
+  if (updated.length === 0) return false;
+  await logEvent(userId, 'user_limits_set', { maxCap, maxReads });
+  return true;
 }
 
 /**

@@ -9,9 +9,13 @@ import {
   createInvite,
   listAllUsers,
   setUserSuspension,
+  setUserLimits,
+  MAX_CAP_CEILING,
+  MAX_READS_CEILING,
   deleteUserAccount,
 } from './users';
-import { resolveSendAttempt } from './send';
+import { resolveSendAttempt, runSendPass } from './send';
+import { IMPORT_LIMIT, importPastRecipients, openDrafts, recentSends, skipApplication } from './applications';
 import { capCeiling, sendCap, stageCap } from './ramp';
 import { markLinkApplied, waitingLinkApplications } from './links';
 import { disconnectGmail, type DisconnectResult } from './gmail';
@@ -22,6 +26,8 @@ import { MasterFacts } from './schemas';
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID ? parseInt(process.env.ADMIN_CHAT_ID, 10) : null;
 const APP_BASE_URL = process.env.APP_BASE_URL || 'http://localhost:3000';
+// Hard daily ceiling on X reads (spec: X_MAX_DAILY_READS, default 300); admin overrides stay within it.
+const X_MAX_DAILY_READS = parseInt(process.env.X_MAX_DAILY_READS || '300', 10);
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // E2E only: point Bot API calls at a fake server. Unset in every real environment.
 const TELEGRAM_API_BASE_URL = process.env.TELEGRAM_API_BASE_URL || 'https://api.telegram.org';
@@ -128,6 +134,18 @@ function disconnectMessage(result: DisconnectResult): string {
     case 'not_connected':
       return 'Gmail is not connected.';
   }
+}
+
+/** Calls one of the app's own cron routes with the configured secret; there is no fallback secret. */
+async function runOwnCron(name: 'ingest' | 'process'): Promise<unknown> {
+  const secret = process.env.CRON_SECRET;
+  if (!secret) throw new Error('CRON_SECRET is not configured.');
+  const res = await fetch(`${APP_BASE_URL}/api/cron/${name}`, {
+    headers: { Authorization: `Bearer ${secret}` },
+    cache: 'no-store',
+  });
+  if (!res.ok) throw new Error(`/api/cron/${name} answered ${res.status}.`);
+  return res.json();
 }
 
 const ADMIN_COMMANDS = new Set(['/invite', '/users', '/suspend', '/unsuspend', '/limits']);
@@ -625,38 +643,83 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
     }
 
     case '/run': {
+      // Users run the send pass (the cron's own, under every cap and lock). Ingest and processing spend
+      // the shared X and Gemini budget, so only the admin can start them early.
+      try {
+        if (isAdmin) {
+          await sendTelegramMessage(chatId, '🚀 Running ingest, processing and a send pass...');
+          const ingest = await runOwnCron('ingest');
+          const processed = await runOwnCron('process');
+          await sendTelegramMessage(chatId, `Ingest: \`${JSON.stringify(ingest)}\`\nProcess: \`${JSON.stringify(processed)}\``);
+        }
+        const pass = await runSendPass();
+        await sendTelegramMessage(
+          chatId,
+          `✅ *Send pass finished.* Sent: ${pass.outcomes.sent}, dry-run previews: ${pass.dryRuns}, ` +
+            `waiting (caps, spacing or window): ${pass.skipped}.`
+        );
+      } catch (err) {
+        console.error('/run failed:', err);
+        await sendTelegramMessage(chatId, '❌ The run failed. Details are in the server log.');
+      }
+      break;
+    }
+
+    case '/reads': {
+      const reads = parseInt(args[0], 10);
+      if (isNaN(reads) || reads < 1 || reads > settings.max_reads_ceiling) {
+        await sendTelegramMessage(
+          chatId,
+          `Usage: \`/reads <number>\` between 1 and ${settings.max_reads_ceiling} (current: ${settings.daily_read_cap}).`
+        );
+        return;
+      }
+      await updateUserSettings(user.id, { daily_read_cap: reads });
+      await sendTelegramMessage(chatId, `✅ Up to ${reads} posts will be reviewed for you each day.`);
+      break;
+    }
+
+    case '/skip': {
+      const appId = args[0];
+      if (!appId || !UUID_PATTERN.test(appId)) {
+        await sendTelegramMessage(chatId, 'Usage: `/skip <application_id>`');
+        return;
+      }
+      const previous = await skipApplication(user.id, appId);
       await sendTelegramMessage(
         chatId,
-        '🚀 *Triggering Pipeline Run...*\n\n' +
-          '1️⃣ Ingesting from X API...\n' +
-          '2️⃣ Extracting & matching with Gemini 3.7...\n' +
-          '3️⃣ Running send / dry-run preview pass...'
+        previous ? `⏭️ Application skipped (was \`${previous}\`).` : 'No application with that id can be skipped (it is not yours, or it is already sending or sent).'
       );
+      break;
+    }
 
-      const baseUrl = process.env.APP_BASE_URL || 'http://localhost:3000';
-      const cronSecret = process.env.CRON_SECRET || 'd7c9e00d19b3f3376fce8ae9a3904858';
-      const headers = { Authorization: `Bearer ${cronSecret}` };
+    case '/last': {
+      const sends = await recentSends(user.id);
+      const lines = sends.map((send) => `• ${send.applied_at.slice(0, 16)} → \`${send.contact_email}\` (${send.email_subject ?? 'no subject'})`);
+      await sendTelegramMessage(chatId, sends.length > 0 ? `📤 *Last sends:*\n\n${lines.join('\n')}` : 'Nothing has been sent yet.');
+      break;
+    }
 
-      try {
-        const ingestRes = await fetch(`${baseUrl}/api/cron/ingest`, { headers }).then((r) => r.json());
-        const processRes = await fetch(`${baseUrl}/api/cron/process`, { headers }).then((r) => r.json());
-        const sendRes = await fetch(`${baseUrl}/api/cron/send`, { headers }).then((r) => r.json());
+    case '/drafts': {
+      const drafts = await openDrafts(user.id);
+      const lines = drafts.map(
+        (draft) => `• ${draft.kind} to \`${draft.contact_email}\`: https://mail.google.com/mail/u/0/#all/${draft.gmail_thread_id}`
+      );
+      await sendTelegramMessage(chatId, drafts.length > 0 ? `📝 *Drafts waiting in Gmail:*\n\n${lines.join('\n')}` : 'No drafts are waiting.');
+      break;
+    }
 
-        const summaryMsg =
-          `✅ *Pipeline Run Completed!*\n\n` +
-          `• *Ingested:* ${ingestRes.jobsInserted ?? 0} new jobs (searched ${ingestRes.tweetsFetched ?? 0})\n` +
-          `• *Jobs Extracted:* ${processRes.summary?.jobsExtracted ?? 0}\n` +
-          `• *Applications Matched:* ${processRes.summary?.applicationsMatched ?? 0}\n` +
-          `• *Applications Tailored:* ${processRes.summary?.applicationsTailored ?? 0}\n` +
-          `• *Dry-Run Previews:* ${sendRes.dryRuns ?? 0}\n` +
-          `• *Live Emails Sent:* ${sendRes.sent ?? 0}\n` +
-          (sendRes.skipped ? `• *Skipped:* ${sendRes.skipped} (cap limit or outside window)\n` : '');
-
-        await sendTelegramMessage(chatId, summaryMsg);
-      } catch (err: unknown) {
-        const msg = err instanceof Error ? err.message : String(err);
-        await sendTelegramMessage(chatId, `❌ Pipeline execution error: ${msg}`);
+    case '/import': {
+      if (args.length === 0 || args.length > IMPORT_LIMIT) {
+        await sendTelegramMessage(chatId, `Usage: \`/import <email> [email ...]\` (up to ${IMPORT_LIMIT} at a time)`);
+        return;
       }
+      const result = await importPastRecipients(user.id, args);
+      await sendTelegramMessage(
+        chatId,
+        `✅ Imported ${result.imported} past recipient(s); ${result.alreadyKnown} already known.` +
+          (result.invalid.length > 0 ? `\nNot valid addresses: ${result.invalid.join(', ')}` : '')
+      );
       break;
     }
 
@@ -664,17 +727,13 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
       const tweetMatch = text.match(/(?:twitter|x)\.com\/\w+\/status\/(\d+)/i);
       if (tweetMatch) {
         await sendTelegramMessage(chatId, `🔍 *Detected Job Post URL!* Processing via pipeline...`);
-        const baseUrl = process.env.APP_BASE_URL || 'http://localhost:3000';
-        const cronSecret = process.env.CRON_SECRET || 'd7c9e00d19b3f3376fce8ae9a3904858';
-        const headers = { Authorization: `Bearer ${cronSecret}` };
-
         try {
-          await fetch(`${baseUrl}/api/cron/process`, { headers });
-          await fetch(`${baseUrl}/api/cron/send`, { headers });
+          await runOwnCron('process');
+          await runSendPass();
           await sendTelegramMessage(chatId, `✅ Finished processing post!`);
         } catch (err: unknown) {
-          const msg = err instanceof Error ? err.message : String(err);
-          await sendTelegramMessage(chatId, `❌ Error processing post: ${msg}`);
+          console.error('Manual post processing failed:', err);
+          await sendTelegramMessage(chatId, '❌ Error processing post. Details are in the server log.');
         }
         break;
       }
@@ -682,7 +741,7 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
       await sendTelegramMessage(
         chatId,
         `Unknown command. Available commands:\n` +
-          `• \`/run\` - 🚀 Run full pipeline (Ingest → Tailor → Send)\n` +
+          `• \`/run\` - 🚀 Run a send pass now\n` +
           `• \`/status\` - Overview & queue stats\n` +
           `• \`/connect\` - Link your Gmail\n` +
           `• \`/pause\` / \`/resume\` - Pause/resume sends\n` +
@@ -843,25 +902,70 @@ async function handleAdminCommand(
       break;
     }
 
-    case '/suspend': {
+    case '/suspend':
+    case '/unsuspend': {
       const targetId = args[0];
-      if (!targetId) {
-        await sendTelegramMessage(chatId, 'Usage: `/suspend <user_id>`');
+      const suspend = action === '/suspend';
+      if (!targetId || !UUID_PATTERN.test(targetId)) {
+        await sendTelegramMessage(chatId, `Usage: \`${action} <user_id>\` (ids are in \`/users\`)`);
         return;
       }
-      await setUserSuspension(targetId, true);
-      await sendTelegramMessage(chatId, `⛔ User \`${targetId}\` suspended.`);
+      const changed = await setUserSuspension(targetId, suspend);
+      await sendTelegramMessage(
+        chatId,
+        changed
+          ? suspend ? `⛔ User \`${targetId}\` suspended.` : `✅ User \`${targetId}\` restored.`
+          : `No ${suspend ? 'active' : 'suspended'} user with id \`${targetId}\` (the admin cannot be suspended).`
+      );
       break;
     }
 
-    case '/unsuspend': {
-      const targetId = args[0];
-      if (!targetId) {
-        await sendTelegramMessage(chatId, 'Usage: `/unsuspend <user_id>`');
+    case '/limits': {
+      // /limits <user_id> cap N reads N
+      const [targetId, capWord, capArg, readsWord, readsArg] = args;
+      const maxCap = parseInt(capArg, 10);
+      const maxReads = parseInt(readsArg, 10);
+      const valid =
+        targetId !== undefined && UUID_PATTERN.test(targetId) && capWord === 'cap' && readsWord === 'reads' &&
+        maxCap >= 1 && maxCap <= MAX_CAP_CEILING && maxReads >= 1 && maxReads <= MAX_READS_CEILING;
+      if (!valid) {
+        await sendTelegramMessage(
+          chatId,
+          `Usage: \`/limits <user_id> cap <1-${MAX_CAP_CEILING}> reads <1-${MAX_READS_CEILING}>\``
+        );
         return;
       }
-      await setUserSuspension(targetId, false);
-      await sendTelegramMessage(chatId, `✅ User \`${targetId}\` restored.`);
+      const updated = await setUserLimits(targetId, maxCap, maxReads);
+      await sendTelegramMessage(
+        chatId,
+        updated ? `✅ Limits for \`${targetId}\`: cap ${maxCap}, reads ${maxReads}.` : `No user with id \`${targetId}\`.`
+      );
+      break;
+    }
+
+    case '/admin_xreads':
+    case '/admin_threads': {
+      const value = parseInt(command === '/admin' ? args[1] : args[0], 10);
+      const key = action === '/admin_xreads' ? 'x_daily_read_cap' : 'x_daily_thread_cap';
+      // Thread expansion spends X reads, so both are bounded by the hard daily X read limit.
+      if (isNaN(value) || value < 0 || value > X_MAX_DAILY_READS) {
+        await sendTelegramMessage(chatId, `Usage: \`/admin ${action.slice(7)} <0-${X_MAX_DAILY_READS}>\``);
+        return;
+      }
+      await sql`update global_settings set value = ${String(value)} where key = ${key}`;
+      await logEvent(adminUserId, 'global_setting_changed', { key, value });
+      await sendTelegramMessage(chatId, `✅ \`${key}\` set to ${value}.`);
+      break;
+    }
+
+    case '/admin_ingest': {
+      try {
+        const ingest = await runOwnCron('ingest');
+        await sendTelegramMessage(chatId, `✅ Ingest finished: \`${JSON.stringify(ingest)}\``);
+      } catch (err) {
+        console.error('/admin ingest failed:', err);
+        await sendTelegramMessage(chatId, '❌ Ingest failed. Details are in the server log.');
+      }
       break;
     }
 
