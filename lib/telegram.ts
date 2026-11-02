@@ -38,20 +38,29 @@ export async function sendTelegramMessage(
     return true;
   }
 
-  try {
+  const post = (body: Record<string, unknown>) =>
     // Next 14 caches fetch() inside GET route handlers (every cron), POSTs included.
     // A cached reply means the message is silently never sent.
-    const res = await fetch(`${TELEGRAM_API_BASE_URL}/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    fetch(`${TELEGRAM_API_BASE_URL}/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: 'POST',
       cache: 'no-store',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: chatId,
-        text,
-        parse_mode: parseMode,
-      }),
+      body: JSON.stringify({ chat_id: chatId, text, ...body }),
     });
-    return res.ok;
+
+  try {
+    const res = await post({ parse_mode: parseMode });
+    if (res.ok) return true;
+    // Untrusted text (a recruiter's snippet, an email body) can break the markup, and Telegram then
+    // rejects the whole message with 400. Losing an alert is worse than losing its formatting.
+    if (res.status === 400) {
+      const plain = await post({});
+      if (plain.ok) return true;
+      console.error(`Telegram rejected a message to ${chatId} even as plain text (${plain.status}).`);
+      return false;
+    }
+    console.error(`Telegram rejected a message to ${chatId} (${res.status}).`);
+    return false;
   } catch (err) {
     console.error(`Failed to send Telegram message to ${chatId}:`, err);
     return false;

@@ -219,18 +219,42 @@ export const FULL_GMAIL_SCOPE = [
   'https://www.googleapis.com/auth/gmail.compose',
 ].join(' ');
 
+/** A message in a Gmail thread, as the fake returns it from threads.get. */
+export interface ThreadMessage {
+  id: string;
+  from: string;
+  messageIdHeader: string;
+  snippet: string;
+}
+
+export interface GeminiClassification {
+  category: 'interview' | 'assessment' | 'question' | 'rejection' | 'auto' | 'other';
+  summary: string;
+  suggested_action: string;
+}
+
 export interface FakeProviders {
   oauthGrant: OAuthGrant;
+  /** When true, refreshing an access token fails with invalid_grant (access revoked). */
+  refreshFails: boolean;
+  /** Application threads by Gmail thread id. */
+  threads: Record<string, ThreadMessage[]>;
+  threadFetches: Record<string, number>;
+  drafts: Array<{ threadId: string; to: string; subject: string; inReplyTo: string }>;
+  geminiClassification: GeminiClassification;
+  geminiCalls: number;
   /** Tokens Google was asked to revoke, exactly as received. */
   revokedTokens: string[];
   /** Every messages.send request Gmail received, whatever it answered. */
   sendRequests: number;
   /** Messages Gmail stored in the Sent folder. */
   sent: GmailMessage[];
-  /** Bounce notices (from mailer-daemon) in the inbox. */
-  bounces: Array<{ id: string; threadId: string; snippet: string }>;
+  /** Bounce notices (from mailer-daemon) in the inbox; `receivedAt` defaults to now (epoch ms). */
+  bounces: Array<{ id: string; threadId: string; snippet: string; receivedAt?: number }>;
   // chat_id arrives as a string when it was read from the bigint column, as a number otherwise.
   telegram: Array<{ chatId: number | string; text: string }>;
+  /** Messages the fake Telegram rejected for bad Markdown. */
+  telegramRejected: number;
   unexpected: string[];
   sendBehavior: SendBehavior;
   reset(): void;
@@ -239,23 +263,42 @@ export interface FakeProviders {
 
 export async function startFakeProviders(): Promise<FakeProviders> {
   const hanging = new Set<ServerResponse>();
+  const defaultClassification = (): GeminiClassification => ({
+    category: 'interview',
+    summary: 'The recruiter asks for a call.',
+    suggested_action: 'Reply with availability.',
+  });
   const defaultGrant = (): OAuthGrant => ({ scope: FULL_GMAIL_SCOPE, emailAddress: 'candidate@gmail.com', withRefreshToken: true });
   const state: FakeProviders = {
     oauthGrant: defaultGrant(),
+    refreshFails: false,
+    threads: {},
+    threadFetches: {},
+    drafts: [],
+    geminiClassification: defaultClassification(),
+    geminiCalls: 0,
     revokedTokens: [],
     sendRequests: 0,
     sent: [],
     bounces: [],
     telegram: [],
+    telegramRejected: 0,
     unexpected: [],
     sendBehavior: 'accept',
     reset() {
       state.oauthGrant = defaultGrant();
+      state.refreshFails = false;
+      state.threads = {};
+      state.threadFetches = {};
+      state.drafts = [];
+      state.geminiClassification = defaultClassification();
+      state.geminiCalls = 0;
       state.revokedTokens = [];
       state.sendRequests = 0;
       state.sent = [];
       state.bounces = [];
       state.telegram = [];
+      state.telegramRejected = 0;
       state.unexpected = [];
       state.sendBehavior = 'accept';
     },
@@ -280,6 +323,9 @@ export async function startFakeProviders(): Promise<FakeProviders> {
           scope: grant.scope,
           ...(grant.withRefreshToken ? { refresh_token: refreshTokenFor(form.get('code') ?? '') } : {}),
         });
+      }
+      if (state.refreshFails) {
+        return json(res, 400, { error: 'invalid_grant', error_description: 'Token has been expired or revoked.' });
       }
       return json(res, 200, { access_token: 'fake-access-token', expires_in: 3600, token_type: 'Bearer' });
     }
@@ -340,10 +386,56 @@ export async function startFakeProviders(): Promise<FakeProviders> {
       });
     }
 
+    const threadMatch = /^\/gmail\/v1\/users\/me\/threads\/([^/]+)$/.exec(url.pathname);
+    if (req.method === 'GET' && threadMatch) {
+      const threadId = threadMatch[1];
+      state.threadFetches[threadId] = (state.threadFetches[threadId] ?? 0) + 1;
+      return json(res, 200, {
+        id: threadId,
+        messages: (state.threads[threadId] ?? []).map((m) => ({
+          id: m.id,
+          threadId,
+          snippet: m.snippet,
+          payload: {
+            headers: [
+              { name: 'From', value: m.from },
+              { name: 'Message-ID', value: m.messageIdHeader },
+            ],
+          },
+        })),
+      });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/gmail/v1/users/me/drafts') {
+      const { message } = JSON.parse(body);
+      const raw = Buffer.from(message.raw, 'base64url').toString('utf8');
+      state.drafts.push({
+        threadId: message.threadId,
+        to: header(raw, 'To'),
+        subject: header(raw, 'Subject'),
+        inReplyTo: header(raw, 'In-Reply-To'),
+      });
+      return json(res, 200, { id: `draft-${state.drafts.length}`, message: { id: `draft-msg-${state.drafts.length}` } });
+    }
+
+    if (req.method === 'POST' && url.pathname.startsWith('/gemini/') && url.pathname.endsWith(':generateContent')) {
+      state.geminiCalls++;
+      const prompt: string = JSON.parse(body).contents?.[0]?.parts?.[0]?.text ?? '';
+      const answer = prompt.includes('Categorize this message')
+        ? state.geminiClassification
+        : { reply_body: 'Thank you for reaching out. I am available for a call. [Insert your preferred times here]', availability_placeholder_used: true };
+      return json(res, 200, {
+        candidates: [{ content: { role: 'model', parts: [{ text: JSON.stringify(answer) }] }, finishReason: 'STOP' }],
+      });
+    }
+
     const messageMatch = /^\/gmail\/v1\/users\/me\/messages\/([^/]+)$/.exec(url.pathname);
     if (req.method === 'GET' && messageMatch) {
       const bounce = state.bounces.find((b) => b.id === messageMatch[1]);
-      if (bounce) return json(res, 200, { id: bounce.id, threadId: bounce.threadId, snippet: bounce.snippet });
+      if (bounce) {
+        const internalDate = String(bounce.receivedAt ?? Date.now());
+        return json(res, 200, { id: bounce.id, threadId: bounce.threadId, snippet: bounce.snippet, internalDate });
+      }
       const message = state.sent.find((m) => m.id === messageMatch[1]);
       if (!message) return json(res, 404, { error: { code: 404, message: 'Not found' } });
       return json(res, 200, { id: message.id, threadId: message.threadId, internalDate: message.internalDate });
@@ -356,6 +448,11 @@ export async function startFakeProviders(): Promise<FakeProviders> {
 
     if (req.method === 'POST' && url.pathname === `/bot${BOT_TOKEN}/sendMessage`) {
       const message = JSON.parse(body);
+      // Like the real Bot API: unbalanced Markdown entities reject the whole message.
+      if (message.parse_mode === 'Markdown' && (message.text.match(/\*/g) ?? []).length % 2 === 1) {
+        state.telegramRejected++;
+        return json(res, 400, { ok: false, error_code: 400, description: "Bad Request: can't parse entities" });
+      }
       state.telegram.push({ chatId: message.chat_id, text: message.text });
       return json(res, 200, { ok: true, result: {} });
     }
@@ -416,6 +513,8 @@ export async function startApp(databaseUrl: string, env: Record<string, string |
       GMAIL_CLIENT_SECRET: 'e2e-client-secret',
       GOOGLE_API_ROOT_URL: `${FAKE_URL}/`,
       GOOGLE_OAUTH_ROOT_URL: `${FAKE_URL}/oauth`,
+      GEMINI_API_KEY: 'e2e-gemini-key',
+      GEMINI_API_BASE_URL: `${FAKE_URL}/gemini`,
       TOKEN_ENCRYPTION_KEY: ENCRYPTION_KEY.toString('base64'),
       ...env,
     },
@@ -457,7 +556,7 @@ export async function getApp(pathAndQuery: string, headers: Record<string, strin
   return fetch(`${APP_URL}${pathAndQuery}`, { headers, redirect: 'manual' });
 }
 
-export async function runCron(name: 'send' | 'summary' | 'inbox'): Promise<Record<string, unknown>> {
+export async function runCron(name: 'send' | 'summary' | 'inbox' | 'followups'): Promise<Record<string, unknown>> {
   const res = await fetch(`${APP_URL}/api/cron/${name}`, { headers: { authorization: `Bearer ${CRON_SECRET}` } });
   const body = (await res.json()) as Record<string, unknown>;
   if (res.status !== 200) {

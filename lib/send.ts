@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import type { gmail_v1 } from 'googleapis';
 import { sql, withTransaction, logEvent, assertUserScope } from './db';
-import { autoPause, pauseAfterConsecutiveFailures, sendCap } from './ramp';
+import { autoPause, pauseAfterConsecutiveFailures, pauseForLostGmailAccess, sendCap } from './ramp';
 import {
   getGmailClientForUser,
   buildMimeMessage,
@@ -565,8 +565,7 @@ async function recordUncertain(attempt: AttemptRef, error: string): Promise<void
 }
 
 async function handleGmailAuthLoss(attempt: AttemptRef): Promise<void> {
-  await sql`update users set gmail_status = 'error' where id = ${attempt.user_id}`;
-  await autoPause(attempt.user_id, 'Gmail access was revoked or has expired. Reconnect with `/connect` before resuming.');
+  await pauseForLostGmailAccess(attempt.user_id);
 }
 
 /**

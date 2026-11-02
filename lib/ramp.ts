@@ -130,6 +130,12 @@ export async function autoPause(userId: string, reason: string): Promise<void> {
   }
 }
 
+/** Marks the user's Gmail connection broken and pauses them until they reconnect. */
+export async function pauseForLostGmailAccess(userId: string): Promise<void> {
+  await sql`update users set gmail_status = 'error' where id = ${userId}`;
+  await autoPause(userId, 'Gmail access was revoked or has expired. Reconnect with `/connect` before resuming.');
+}
+
 /** Pauses after three confirmed send failures in a row. */
 export async function pauseAfterConsecutiveFailures(userId: string): Promise<void> {
   const recent = (await sql`

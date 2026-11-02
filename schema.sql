@@ -271,3 +271,7 @@ create unique index if not exists users_gmail_address_unique
 
 -- Set when a dry-run preview of the application is shown, so each one is previewed (and counted) once.
 alter table applications add column if not exists dry_run_previewed_at timestamptz;
+
+-- Inbox scan bookkeeping: threads are checked in rotation, and each inbound message is handled once.
+alter table applications add column if not exists thread_checked_at timestamptz;
+alter table applications add column if not exists last_inbound_message_id text;

@@ -98,6 +98,7 @@ async function seedSentDaysAgo(userId: string, daysAgo: number, recipient: strin
      where id = $1`,
     [attemptId, daysAgo]
   );
+  await db.pool.query('update applications set applied_at = now() - make_interval(days => $2) where id = $1', [applicationId, daysAgo]);
 }
 
 async function settingsOf(chatId: number) {

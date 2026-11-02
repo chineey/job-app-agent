@@ -205,7 +205,7 @@ export async function searchSentMailByMessageId(
  */
 export async function searchBounces(
   gmail: gmail_v1.Gmail
-): Promise<Array<{ id: string; threadId: string; snippet: string; body: string }>> {
+): Promise<Array<{ id: string; threadId: string; snippet: string; body: string; receivedAt: Date }>> {
   const query = 'from:mailer-daemon OR from:postmaster newer_than:2d';
   const listRes = await gmail.users.messages.list({
     userId: 'me',
@@ -214,7 +214,7 @@ export async function searchBounces(
   });
 
   const messages = listRes.data.messages || [];
-  const results: Array<{ id: string; threadId: string; snippet: string; body: string }> = [];
+  const results: Array<{ id: string; threadId: string; snippet: string; body: string; receivedAt: Date }> = [];
 
   for (const m of messages) {
     if (!m.id) continue;
@@ -229,6 +229,7 @@ export async function searchBounces(
         threadId: detail.data.threadId || '',
         snippet: detail.data.snippet || '',
         body: detail.data.snippet || '',
+        receivedAt: new Date(Number(detail.data.internalDate ?? Date.now())),
       });
     } catch {
       // Skip message if read error occurs
@@ -245,7 +246,7 @@ export async function getThreadInboundMessages(
   gmail: gmail_v1.Gmail,
   threadId: string,
   userEmail: string
-): Promise<Array<{ id: string; from: string; snippet: string; text: string; date: string }>> {
+): Promise<Array<{ id: string; from: string; messageIdHeader: string; snippet: string; text: string; date: string }>> {
   const threadRes = await gmail.users.threads.get({
     userId: 'me',
     id: threadId,
@@ -253,12 +254,13 @@ export async function getThreadInboundMessages(
   });
 
   const messages = threadRes.data.messages || [];
-  const inbound: Array<{ id: string; from: string; snippet: string; text: string; date: string }> = [];
+  const inbound: Array<{ id: string; from: string; messageIdHeader: string; snippet: string; text: string; date: string }> = [];
 
   for (const m of messages) {
     const headers = m.payload?.headers || [];
     const fromHeader = headers.find((h) => h.name?.toLowerCase() === 'from')?.value || '';
     const dateHeader = headers.find((h) => h.name?.toLowerCase() === 'date')?.value || '';
+    const messageIdHeader = headers.find((h) => h.name?.toLowerCase() === 'message-id')?.value || '';
 
     // Ignore messages sent by candidate themselves
     if (userEmail && fromHeader.toLowerCase().includes(userEmail.toLowerCase())) {
@@ -268,6 +270,7 @@ export async function getThreadInboundMessages(
     inbound.push({
       id: m.id || '',
       from: fromHeader,
+      messageIdHeader,
       snippet: m.snippet || '',
       text: m.snippet || '',
       date: dateHeader,
@@ -278,7 +281,8 @@ export async function getThreadInboundMessages(
 }
 
 /**
- * Creates a Gmail draft in an existing application thread.
+ * Creates a Gmail draft in an existing application thread. Drafts are never sent by the agent.
+ * `inReplyTo` is the RFC Message-ID being answered, so the recipient's mail client threads the reply.
  */
 export async function createGmailDraft(
   gmail: gmail_v1.Gmail,
@@ -288,14 +292,15 @@ export async function createGmailDraft(
     subject: string;
     bodyText: string;
     threadId: string;
+    inReplyTo: string | null;
   }
 ): Promise<{ id: string; messageId: string }> {
+  const replyHeaders = params.inReplyTo ? [`In-Reply-To: ${params.inReplyTo}`, `References: ${params.inReplyTo}`] : [];
   const rawMime = [
     `To: ${params.to}`,
     `From: ${params.from}`,
     `Subject: ${params.subject}`,
-    `In-Reply-To: ${params.threadId}`,
-    `References: ${params.threadId}`,
+    ...replyHeaders,
     'Content-Type: text/plain; charset=UTF-8',
     '',
     params.bodyText,
