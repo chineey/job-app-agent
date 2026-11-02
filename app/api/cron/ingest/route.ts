@@ -4,6 +4,9 @@ import { searchRecentJobPosts } from '@/lib/x';
 import { sql } from '@/lib/db';
 
 export const dynamic = 'force-dynamic';
+// X searches and Gemini calls must be fresh: Next 14 otherwise caches them inside GET routes, so a
+// repeated search URL returned old posts and missed new ones.
+export const fetchCache = 'force-no-store';
 
 /**
  * Cheap pre-filter (Section 7.1):

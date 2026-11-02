@@ -15,6 +15,8 @@ const apiKey = process.env.GEMINI_API_KEY || '';
 const modelName = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
 
 const genAI = new GoogleGenerativeAI(apiKey);
+// E2E only: point Gemini calls at a fake server. Unset in every real environment.
+const geminiRequestOptions = process.env.GEMINI_API_BASE_URL ? { baseUrl: process.env.GEMINI_API_BASE_URL } : undefined;
 
 /**
  * Helper to fetch image and convert to inline data Part for Gemini multimodal calls.
@@ -238,13 +240,16 @@ async function callGeminiWithRetry<T>(
   let currentPrompt = prompt;
 
   for (const modelId of candidateModels) {
-    const model = genAI.getGenerativeModel({
-      model: modelId,
-      generationConfig: {
-        responseMimeType: 'application/json',
-        temperature: 0.1,
+    const model = genAI.getGenerativeModel(
+      {
+        model: modelId,
+        generationConfig: {
+          responseMimeType: 'application/json',
+          temperature: 0.1,
+        },
       },
-    });
+      geminiRequestOptions
+    );
 
     for (let attempt = 0; attempt < 2; attempt++) {
       try {

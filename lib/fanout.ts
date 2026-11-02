@@ -13,6 +13,9 @@ export interface FanoutResult {
 export async function fanoutJobToEligibleUsers(job: JobRecord): Promise<FanoutResult> {
   const isManual = job.source === 'manual';
   const submittingUserId = job.submitted_by;
+  // A manually submitted post only fans out to the user who sent it. (A nested sql`` fragment here
+  // ran as its own query, so fan-out failed for every job.)
+  const manualSubmitter = isManual && submittingUserId ? submittingUserId : null;
   const today = new Date().toISOString().slice(0, 10);
 
   // 1. Fetch eligible active users with active facts
@@ -28,7 +31,7 @@ export async function fanoutJobToEligibleUsers(job: JobRecord): Promise<FanoutRe
     left join user_spend usp on usp.user_id = u.id and usp.day = ${today}
     where u.status = 'active'
       and us.paused = false
-      ${isManual && submittingUserId ? sql`and u.id = ${submittingUserId}` : sql``}
+      and (${manualSubmitter}::uuid is null or u.id = ${manualSubmitter})
   `) as { user_id: string; daily_read_cap: number; reviewed_today: number; facts_version_id: number }[];
 
   // Filter users by review budget

@@ -6,6 +6,8 @@ import { sendTelegramMessage } from '@/lib/telegram';
 import { MasterFacts } from '@/lib/schemas';
 
 export const dynamic = 'force-dynamic';
+// Outbound calls create drafts and alerts; never serve one from Next's fetch cache.
+export const fetchCache = 'force-no-store';
 export const maxDuration = 60;
 
 export async function GET(req: NextRequest) {
@@ -14,17 +16,20 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    // Select sent applications 7+ days old with no replies and no follow-up draft created
+    // Sent 7+ days ago, no reply, no follow-up yet, for active users only. The original attempt's
+    // Message-ID threads the follow-up onto the application in the recruiter's mail client.
     const candidateApps = (await sql`
-      select a.*, u.telegram_chat_id, u.gmail_address, f.facts
+      select a.*, u.telegram_chat_id, u.gmail_address, f.facts, sent.rfc_message_id
       from applications a
       join users u on a.user_id = u.id
       left join facts_versions f on a.facts_version_id = f.id
+      left join send_attempts sent on sent.application_id = a.id and sent.state = 'sent'
       where a.status = 'sent'
         and a.applied_at <= now() - interval '7 days'
         and a.reply_type is null
         and a.followup_draft_id is null
         and a.gmail_thread_id is not null
+        and u.status = 'active'
         and u.gmail_status = 'connected'
       limit 10;
     `) as Array<{
@@ -37,6 +42,7 @@ export async function GET(req: NextRequest) {
       telegram_chat_id: number;
       gmail_address: string;
       facts: MasterFacts | null;
+      rfc_message_id: string | null;
     }>;
 
     let followupsDrafted = 0;
@@ -63,6 +69,7 @@ export async function GET(req: NextRequest) {
           subject: `Following Up: ${app.email_subject || 'Application'}`,
           bodyText: followUpBody,
           threadId: app.gmail_thread_id,
+          inReplyTo: app.rfc_message_id,
         });
 
         await sql`

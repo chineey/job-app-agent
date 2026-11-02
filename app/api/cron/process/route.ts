@@ -18,6 +18,9 @@ import { generateResumePdfBuffer } from '@/lib/pdf/Resume';
 import { put } from '@vercel/blob';
 
 export const dynamic = 'force-dynamic';
+// X searches and Gemini calls must be fresh: Next 14 otherwise caches them inside GET routes, so a
+// repeated search URL returned old posts and missed new ones.
+export const fetchCache = 'force-no-store';
 
 /**
  * Main batch processing worker (Section 4 & Section 7)
