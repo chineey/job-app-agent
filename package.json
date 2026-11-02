@@ -10,6 +10,7 @@
     "start": "next start",
     "lint": "next lint",
     "test": "vitest run",
+    "check": "tsc --noEmit && vitest run && next build && npm run test:e2e",
     "test:e2e": "rm -rf artifacts/e2e && mkdir -p artifacts/e2e && node --test --test-concurrency=1 --test-reporter=spec --test-reporter-destination=stdout --test-reporter=spec --test-reporter-destination=artifacts/e2e/report.txt --test-reporter=junit --test-reporter-destination=artifacts/e2e/junit.xml e2e/*.e2e.mts"
   },
   "dependencies": {
