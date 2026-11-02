@@ -107,8 +107,11 @@ describe('send safety', () => {
     const second = await seedApplication(db, userId, { recipient: 'jobs@second.test' });
     const workerB = runSendCron();
     await waitForClaim(second);
-    await waitForLockWaiters(db, 2);
-    await gate.release();
+    try {
+      await waitForLockWaiters(db, 2);
+    } finally {
+      await gate.release();
+    }
 
     const responses = await Promise.all([workerA, workerB]);
     evidence.cronResponses = responses;
@@ -137,8 +140,11 @@ describe('send safety', () => {
     await db.pool.query(`update applications set locked_at = now() - interval '11 minutes' where id = $1`, [applicationId]);
     const currentWorker = runSendCron();
     const currentToken = await waitForClaim(applicationId, staleToken);
-    await waitForLockWaiters(db, 2);
-    await gate.release();
+    try {
+      await waitForLockWaiters(db, 2);
+    } finally {
+      await gate.release();
+    }
 
     const responses = await Promise.all([staleWorker, currentWorker]);
     evidence.cronResponses = responses;

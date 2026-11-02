@@ -123,8 +123,11 @@ describe('telegram access', () => {
     const gate = await holdRowLock(db, 'select 1 from invites where code = $1 for update', ['RACE0001']);
     const first = postTelegramUpdate(telegramUpdate(3001, '/start RACE0001'));
     const second = postTelegramUpdate(telegramUpdate(3002, '/start RACE0001'));
-    await waitForLockWaiters(db, 2);
-    await gate.release();
+    try {
+      await waitForLockWaiters(db, 2);
+    } finally {
+      await gate.release();
+    }
     assert.deepEqual(await Promise.all([first, second]), [200, 200]);
 
     const registered = [await userByChat(3001), await userByChat(3002)].filter(Boolean);

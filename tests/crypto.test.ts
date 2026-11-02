@@ -1,5 +1,8 @@
+import crypto from 'crypto';
 import { describe, it, expect } from 'vitest';
 import { encryptToken, decryptToken } from '../lib/crypto';
+
+process.env.TOKEN_ENCRYPTION_KEY = crypto.randomBytes(32).toString('base64');
 
 describe('AES-256-GCM Token Encryption', () => {
   it('encrypts and decrypts a refresh token accurately', () => {

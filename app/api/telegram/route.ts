@@ -1,20 +1,11 @@
-import crypto from 'crypto';
 import { NextRequest, NextResponse } from 'next/server';
+import { secretsMatch } from '@/lib/auth';
 import { claimTelegramUpdate, handleTelegramMessage, handleTelegramDocument } from '@/lib/telegram';
 
 const TELEGRAM_WEBHOOK_SECRET = process.env.TELEGRAM_WEBHOOK_SECRET || '';
 
-// Fails closed: with no secret configured, nothing is accepted.
-function hasValidSecret(req: NextRequest): boolean {
-  const provided = req.headers.get('x-telegram-bot-api-secret-token');
-  if (!TELEGRAM_WEBHOOK_SECRET || provided === null) return false;
-  // Hashing gives equal-length buffers, which timingSafeEqual requires.
-  const digest = (value: string) => crypto.createHash('sha256').update(value).digest();
-  return crypto.timingSafeEqual(digest(provided), digest(TELEGRAM_WEBHOOK_SECRET));
-}
-
 export async function POST(req: NextRequest) {
-  if (!hasValidSecret(req)) {
+  if (!secretsMatch(req.headers.get('x-telegram-bot-api-secret-token'), TELEGRAM_WEBHOOK_SECRET)) {
     return NextResponse.json({ error: 'Unauthorized webhook secret' }, { status: 401 });
   }
 

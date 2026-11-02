@@ -263,3 +263,8 @@ create table if not exists telegram_updates (
   update_id bigint primary key,
   received_at timestamptz not null default now()
 );
+
+-- One Gmail address per user: sending is serialized and capped per user, so a shared address
+-- would get each user's full allowance.
+create unique index if not exists users_gmail_address_unique
+  on users (lower(gmail_address)) where gmail_address is not null;

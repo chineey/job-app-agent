@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { sql } from '@/lib/db';
-import { getOAuth2Client } from '@/lib/gmail';
+import { getOAuth2Client, GMAIL_SCOPES } from '@/lib/gmail';
 
 export const dynamic = 'force-dynamic';
 
@@ -24,16 +24,11 @@ export async function GET(req: NextRequest) {
   }
 
   const oauth2Client = getOAuth2Client();
-  const scopes = [
-    'https://www.googleapis.com/auth/gmail.send',
-    'https://www.googleapis.com/auth/gmail.readonly',
-    'https://www.googleapis.com/auth/gmail.compose',
-  ];
 
   const authUrl = oauth2Client.generateAuthUrl({
     access_type: 'offline',
     prompt: 'consent',
-    scope: scopes,
+    scope: GMAIL_SCOPES,
     state,
   });
 

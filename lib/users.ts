@@ -258,6 +258,7 @@ export async function deleteUserAccount(userId: string): Promise<void> {
     update users
     set status = 'deleted',
         gmail_refresh_token_enc = null,
+        gmail_address = null,
         gmail_status = 'disconnected'
     where id = ${userId};
   `;

@@ -75,6 +75,14 @@ export async function resetDatabase(db: Database): Promise<void> {
   `);
 }
 
+/** Reverses encryptRefreshToken, to check what the app stored. */
+export function decryptStoredToken(stored: string): string {
+  const [iv, tag, ciphertext] = stored.split(':').map((part) => Buffer.from(part, 'base64'));
+  const decipher = crypto.createDecipheriv('aes-256-gcm', ENCRYPTION_KEY, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(ciphertext), decipher.final()]).toString('utf8');
+}
+
 // Same format as lib/crypto.ts ("iv:authTag:ciphertext", base64). A mismatch makes every send fail.
 function encryptRefreshToken(token: string): string {
   const iv = crypto.randomBytes(12);
@@ -89,7 +97,7 @@ export async function seedUser(db: Database, options: { chatId: number; cap: num
                         gmail_address, gmail_refresh_token_enc, gmail_status, gmail_connected_at)
      values ($1, $2, 'active', now(), 'v3.2', $3, $4, 'connected', now())
      returning id`,
-    [options.chatId, `Synthetic ${options.chatId}`, `candidate${options.chatId}@gmail.com`, encryptRefreshToken('fake-refresh-token')]
+    [options.chatId, `Synthetic ${options.chatId}`, `candidate${options.chatId}@gmail.com`, encryptRefreshToken(seededRefreshToken(options.chatId))]
   );
   const userId = rows[0].id;
   // A 0-24 window keeps the window check open whenever the suite runs.
@@ -100,6 +108,11 @@ export async function seedUser(db: Database, options: { chatId: number; cap: num
   );
   await db.pool.query(`insert into send_state (user_id, next_send_at) values ($1, now() - interval '1 hour')`, [userId]);
   return userId;
+}
+
+/** The plaintext refresh token seedUser stores (encrypted) for a chat. */
+export function seededRefreshToken(chatId: number): string {
+  return `seeded-refresh-${chatId}`;
 }
 
 export async function seedApplication(
@@ -142,6 +155,7 @@ export async function seedAttempt(
 /**
  * Runs a locking query (`select ... for update`) in an open transaction, so concurrent requests
  * queue up behind it as they would under load. Releasing commits and lets them race.
+ * Always release, even when the test fails: an open gate keeps a connection and blocks teardown.
  */
 export async function holdRowLock(db: Database, lockingQuery: string, params: unknown[]): Promise<{ release(): Promise<void> }> {
   const client = await db.pool.connect();
@@ -188,7 +202,23 @@ export interface GmailMessage {
   internalDate: string;
 }
 
+/** What the fake Google consent screen grants on the next authorization-code exchange. */
+export interface OAuthGrant {
+  scope: string;
+  emailAddress: string;
+  withRefreshToken: boolean;
+}
+
+export const FULL_GMAIL_SCOPE = [
+  'https://www.googleapis.com/auth/gmail.send',
+  'https://www.googleapis.com/auth/gmail.readonly',
+  'https://www.googleapis.com/auth/gmail.compose',
+].join(' ');
+
 export interface FakeProviders {
+  oauthGrant: OAuthGrant;
+  /** Tokens Google was asked to revoke, exactly as received. */
+  revokedTokens: string[];
   /** Every messages.send request Gmail received, whatever it answered. */
   sendRequests: number;
   /** Messages Gmail stored in the Sent folder. */
@@ -203,13 +233,18 @@ export interface FakeProviders {
 
 export async function startFakeProviders(): Promise<FakeProviders> {
   const hanging = new Set<ServerResponse>();
+  const defaultGrant = (): OAuthGrant => ({ scope: FULL_GMAIL_SCOPE, emailAddress: 'candidate@gmail.com', withRefreshToken: true });
   const state: FakeProviders = {
+    oauthGrant: defaultGrant(),
+    revokedTokens: [],
     sendRequests: 0,
     sent: [],
     telegram: [],
     unexpected: [],
     sendBehavior: 'accept',
     reset() {
+      state.oauthGrant = defaultGrant();
+      state.revokedTokens = [];
       state.sendRequests = 0;
       state.sent = [];
       state.telegram = [];
@@ -226,8 +261,28 @@ export async function startFakeProviders(): Promise<FakeProviders> {
     const url = new URL(req.url ?? '/', FAKE_URL);
     const body = await readBody(req);
 
-    if (req.method === 'POST' && url.pathname === '/token') {
+    if (req.method === 'POST' && url.pathname === '/oauth/token') {
+      const form = new URLSearchParams(body);
+      if (form.get('grant_type') === 'authorization_code') {
+        const grant = state.oauthGrant;
+        return json(res, 200, {
+          access_token: `access-for-${grant.emailAddress}`,
+          expires_in: 3600,
+          token_type: 'Bearer',
+          scope: grant.scope,
+          ...(grant.withRefreshToken ? { refresh_token: refreshTokenFor(form.get('code') ?? '') } : {}),
+        });
+      }
       return json(res, 200, { access_token: 'fake-access-token', expires_in: 3600, token_type: 'Bearer' });
+    }
+
+    if (req.method === 'POST' && url.pathname === '/oauth/revoke') {
+      state.revokedTokens.push(url.searchParams.get('token') ?? new URLSearchParams(body).get('token') ?? '');
+      return json(res, 200, {});
+    }
+
+    if (req.method === 'GET' && url.pathname === '/gmail/v1/users/me/profile') {
+      return json(res, 200, { emailAddress: state.oauthGrant.emailAddress, messagesTotal: 0 });
     }
 
     if (req.method === 'POST' && url.pathname === '/gmail/v1/users/me/messages/send') {
@@ -294,6 +349,11 @@ export async function startFakeProviders(): Promise<FakeProviders> {
   return state;
 }
 
+/** The refresh token the fake Google issues for an authorization code. */
+export function refreshTokenFor(code: string): string {
+  return `refresh-for-${code}`;
+}
+
 function header(raw: string, name: string): string {
   const match = new RegExp(`^${name}: (.*)$`, 'mi').exec(raw);
   return match ? match[1].trim() : '';
@@ -318,7 +378,8 @@ export interface AppServer {
   stop(signal?: 'SIGTERM' | 'SIGKILL'): Promise<void>;
 }
 
-export async function startApp(databaseUrl: string): Promise<AppServer> {
+/** `env` overrides the defaults below; `undefined` removes a variable. */
+export async function startApp(databaseUrl: string, env: Record<string, string | undefined> = {}): Promise<AppServer> {
   const nextBin = path.join(ROOT, 'node_modules', 'next', 'dist', 'bin', 'next');
   const child: ChildProcess = spawn(process.execPath, [nextBin, 'start', '-p', String(APP_PORT), '-H', '127.0.0.1'], {
     cwd: ROOT,
@@ -335,8 +396,9 @@ export async function startApp(databaseUrl: string): Promise<AppServer> {
       GMAIL_CLIENT_ID: 'e2e-client-id',
       GMAIL_CLIENT_SECRET: 'e2e-client-secret',
       GOOGLE_API_ROOT_URL: `${FAKE_URL}/`,
-      GOOGLE_OAUTH_TOKEN_URL: `${FAKE_URL}/token`,
+      GOOGLE_OAUTH_ROOT_URL: `${FAKE_URL}/oauth`,
       TOKEN_ENCRYPTION_KEY: ENCRYPTION_KEY.toString('base64'),
+      ...env,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -347,13 +409,20 @@ export async function startApp(databaseUrl: string): Promise<AppServer> {
   const exited = new Promise<void>((resolve) => child.once('exit', () => resolve()));
 
   // An unauthenticated cron call answers 401 without touching anything once the server is up.
-  await waitFor('Next.js server to accept requests', async () => {
-    try {
-      return (await fetch(`${APP_URL}/api/cron/send`)).status === 401;
-    } catch {
-      return false;
-    }
-  }, 30_000);
+  try {
+    await waitFor('Next.js server to accept requests', async () => {
+      try {
+        return (await fetch(`${APP_URL}/api/cron/send`)).status === 401;
+      } catch {
+        return false;
+      }
+    }, 30_000);
+  } catch (err) {
+    // Never leave a server on the port: the next start would talk to it instead.
+    child.kill('SIGKILL');
+    await exited;
+    throw new Error(`${err instanceof Error ? err.message : String(err)}\n${log.join('')}`);
+  }
 
   return {
     log,
@@ -362,6 +431,11 @@ export async function startApp(databaseUrl: string): Promise<AppServer> {
       await exited;
     },
   };
+}
+
+/** GET on the app without following redirects. */
+export async function getApp(pathAndQuery: string, headers: Record<string, string> = {}): Promise<Response> {
+  return fetch(`${APP_URL}${pathAndQuery}`, { headers, redirect: 'manual' });
 }
 
 export async function runSendCron(): Promise<Record<string, unknown>> {

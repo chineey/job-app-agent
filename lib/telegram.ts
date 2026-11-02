@@ -12,7 +12,7 @@ import {
   deleteUserAccount,
 } from './users';
 import { resolveSendAttempt } from './send';
-import { revokeGoogleToken } from './gmail';
+import { disconnectGmail, type DisconnectResult } from './gmail';
 import { validateUploadedPdf, extractResumeText, parseResumeTextToFacts } from './parse-resume';
 import { mergeWithActiveFacts, computeFactsDiff } from './facts';
 import { MasterFacts } from './schemas';
@@ -159,6 +159,20 @@ export async function claimTelegramUpdate(updateId: number): Promise<boolean> {
     returning update_id
   `;
   return rows.length > 0;
+}
+
+function disconnectMessage(result: DisconnectResult): string {
+  switch (result) {
+    case 'revoked':
+      return '🔌 Gmail access revoked with Google and disconnected.';
+    case 'not_confirmed':
+      return (
+        '⚠️ Gmail is disconnected here and the token is deleted, but Google did not confirm the revoke. ' +
+        'Remove this app at https://myaccount.google.com/permissions to be sure.'
+      );
+    case 'not_connected':
+      return 'Gmail is not connected.';
+  }
 }
 
 const ADMIN_COMMANDS = new Set(['/invite', '/users', '/suspend', '/unsuspend', '/limits']);
@@ -315,16 +329,8 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
     }
 
     case '/disconnect': {
-      if (user.gmail_refresh_token_enc) {
-        await revokeGoogleToken(user.gmail_refresh_token_enc);
-      }
-      await sql`
-        update users
-        set gmail_refresh_token_enc = null,
-            gmail_status = 'disconnected'
-        where id = ${user.id};
-      `;
-      await sendTelegramMessage(chatId, '🔌 Gmail connection revoked and disconnected.');
+      const result = await disconnectGmail(user.id);
+      await sendTelegramMessage(chatId, disconnectMessage(result));
       break;
     }
 
@@ -462,8 +468,14 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
         );
         return;
       }
+      // Revoke with Google first: deleting our copy alone would leave the token valid.
+      const gmailResult = await disconnectGmail(user.id);
       await deleteUserAccount(user.id);
-      await sendTelegramMessage(chatId, '👋 Your account and associated data have been permanently purged.');
+      await sendTelegramMessage(
+        chatId,
+        '👋 Your account and associated data have been permanently purged.' +
+          (gmailResult === 'not_confirmed' ? `\n\n${disconnectMessage(gmailResult)}` : '')
+      );
       break;
     }
 

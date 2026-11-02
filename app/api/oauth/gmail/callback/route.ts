@@ -1,107 +1,115 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { google } from 'googleapis';
-import { sql, logEvent } from '@/lib/db';
-import { getOAuth2Client } from '@/lib/gmail';
-import { encryptToken } from '@/lib/crypto';
+import { sql } from '@/lib/db';
+import { connectGmail, type ConnectResult } from '@/lib/gmail';
 import { sendTelegramMessage } from '@/lib/telegram';
 
 export const dynamic = 'force-dynamic';
+
+const RETRY = 'Run /connect in Telegram to try again.';
+
+function escapeHtml(text: string): string {
+  return text.replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+}
+
+function page(status: number, title: string, message: string): NextResponse {
+  return new NextResponse(
+    `<!DOCTYPE html>
+<html>
+  <head><meta charset="utf-8"><title>${escapeHtml(title)}</title></head>
+  <body style="font-family: sans-serif; text-align: center; padding: 50px;">
+    <h2>${escapeHtml(title)}</h2>
+    <p>${escapeHtml(message)}</p>
+  </body>
+</html>`,
+    { status, headers: { 'Content-Type': 'text/html; charset=utf-8' } }
+  );
+}
+
+/** What the user is told in Telegram and in the browser for each outcome. */
+function describe(result: ConnectResult): { status: number; title: string; page: string; telegram: string } {
+  switch (result.outcome) {
+    case 'connected':
+      return {
+        status: 200,
+        title: 'Gmail connected',
+        page: `Connected as ${result.gmailAddress}. You can close this window and return to Telegram.`,
+        telegram:
+          `🎉 *Gmail Connected Successfully!*\n\n` +
+          `Connected account: \`${result.gmailAddress}\`\n\n` +
+          `Applications will now be delivered directly from your personal inbox.`,
+      };
+    case 'missing_scopes':
+      return {
+        status: 400,
+        title: 'Permissions missing',
+        page: `Google did not grant every permission the agent needs, so nothing was saved. ${RETRY}`,
+        telegram:
+          `⚠️ *Gmail was not connected.* Google did not grant every permission the agent needs ` +
+          `(send, read and compose). Run \`/connect\` again and leave every box ticked.`,
+      };
+    case 'no_refresh_token':
+      return {
+        status: 400,
+        title: 'Connection incomplete',
+        page: 'Google did not return a long-lived token. Remove this app from your Google Account permissions, then run /connect again.',
+        telegram:
+          `⚠️ *Google skipped returning a refresh token.*\n\n` +
+          `Please visit your Google Account Permissions page, remove this app, and type \`/connect\` again.`,
+      };
+    case 'address_in_use':
+      return {
+        status: 409,
+        title: 'Address already connected',
+        page: 'That Gmail address is already connected to another user of this agent.',
+        telegram: '⚠️ *Gmail was not connected.* That address is already connected to another user. Each Gmail address can belong to one user.',
+      };
+    case 'live_attempts':
+      return {
+        status: 409,
+        title: 'Send still open',
+        page: 'A send from your current Gmail address is still in progress or unconfirmed. Settle it in Telegram first.',
+        telegram:
+          `⚠️ *Gmail address not changed.* A send from \`${result.currentAddress}\` is still in progress or unconfirmed. ` +
+          `Settle it first (see \`/status\`), then reconnect with the new address.`,
+      };
+  }
+}
 
 export async function GET(req: NextRequest) {
   const { searchParams } = new URL(req.url);
   const code = searchParams.get('code');
   const state = searchParams.get('state');
-  const error = searchParams.get('error');
 
-  if (error) {
-    return new NextResponse(`Google authorization error: ${error}`, { status: 400 });
+  if (!state) {
+    return page(400, 'Connection failed', `This link is incomplete. ${RETRY}`);
   }
 
-  if (!code || !state) {
-    return new NextResponse('Missing code or state parameter.', { status: 400 });
-  }
-
-  // 1. Validate state
-  const stateRows = (await sql`
-    select o.*, u.telegram_chat_id
-    from oauth_states o
-    join users u on o.user_id = u.id
+  // Consume the state before anything else, so each /connect link works at most once.
+  const [owner] = (await sql`
+    update oauth_states o
+    set used = true
+    from users u
     where o.state = ${state} and o.used = false and o.expires_at > now()
-    limit 1;
-  `) as Array<{ state: string; user_id: string; telegram_chat_id: number }>;
-
-  if (stateRows.length === 0) {
-    return new NextResponse('Invalid or expired state token. Please run /connect again.', { status: 400 });
+      and u.id = o.user_id and u.status = 'active'
+    returning o.user_id, u.telegram_chat_id
+  `) as Array<{ user_id: string; telegram_chat_id: number }>;
+  if (!owner) {
+    return page(400, 'Link expired', `This link has expired or was already used. ${RETRY}`);
   }
 
-  const { user_id: userId, telegram_chat_id: chatId } = stateRows[0];
+  if (searchParams.get('error') || !code) {
+    return page(400, 'Connection cancelled', `Google did not grant access. ${RETRY}`);
+  }
 
+  let result: ConnectResult;
   try {
-    // 2. Exchange code for tokens
-    const oauth2Client = getOAuth2Client();
-    const { tokens } = await oauth2Client.getToken(code);
-    oauth2Client.setCredentials(tokens);
-
-    if (!tokens.refresh_token) {
-      if (chatId) {
-        await sendTelegramMessage(
-          chatId,
-          `⚠️ *Google skipped returning a refresh token.*\n\n` +
-            `Please visit your Google Account Permissions page, remove this app, and type \`/connect\` again.`
-        );
-      }
-      return new NextResponse('No refresh token received. Please revoke existing access and try again.', { status: 400 });
-    }
-
-    // 3. Get profile email
-    const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
-    const profile = await gmail.users.getProfile({ userId: 'me' });
-    const gmailAddress = profile.data.emailAddress || '';
-
-    // 4. Encrypt refresh token with AES-256-GCM
-    const encryptedToken = encryptToken(tokens.refresh_token);
-
-    // 5. Update user and mark state used
-    await sql`
-      update users
-      set gmail_address = ${gmailAddress},
-          gmail_refresh_token_enc = ${encryptedToken},
-          gmail_status = 'connected',
-          gmail_connected_at = now()
-      where id = ${userId};
-    `;
-
-    await sql`
-      update oauth_states set used = true where state = ${state};
-    `;
-
-    await logEvent(userId, 'gmail_connected', { gmailAddress });
-
-    // 6. Notify candidate in Telegram
-    if (chatId) {
-      await sendTelegramMessage(
-        chatId,
-        `🎉 *Gmail Connected Successfully!*\n\n` +
-          `Connected account: \`${gmailAddress}\`\n\n` +
-          `Applications will now be delivered directly from your personal inbox.`
-      );
-    }
-
-    return new NextResponse(
-      `<!DOCTYPE html>
-      <html>
-        <head><title>Gmail Connected</title></head>
-        <body style="font-family: sans-serif; text-align: center; padding: 50px;">
-          <h2 style="color: #10b981;">Gmail Connected Successfully!</h2>
-          <p>Connected as <strong>${gmailAddress}</strong>.</p>
-          <p>You can now close this window and return to Telegram.</p>
-        </body>
-      </html>`,
-      { headers: { 'Content-Type': 'text/html' } }
-    );
-  } catch (err: unknown) {
-    const errorMsg = err instanceof Error ? err.message : String(err);
-    console.error('OAuth callback error:', err);
-    return new NextResponse(`OAuth authorization failed: ${errorMsg}`, { status: 500 });
+    result = await connectGmail(owner.user_id, code);
+  } catch (err) {
+    console.error('Gmail OAuth callback failed:', err);
+    return page(500, 'Connection failed', `Something went wrong while connecting Gmail. ${RETRY}`);
   }
+
+  const view = describe(result);
+  await sendTelegramMessage(owner.telegram_chat_id, view.telegram);
+  return page(view.status, view.title, view.page);
 }
