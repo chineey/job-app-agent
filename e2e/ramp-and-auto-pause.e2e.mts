@@ -160,7 +160,8 @@ describe('ramp and auto-pause', () => {
       [userId]
     );
     await db.pool.query(
-      `insert into facts_versions (user_id, source, facts, status) values ($1, 'seed', '{"years_experience": 3}', 'active')`,
+      `insert into facts_versions (user_id, source, facts, status, years_confirmed)
+       values ($1, 'seed', '{"years_experience": 3}', 'active', true)`,
       [userId]
     );
 

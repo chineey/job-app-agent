@@ -243,6 +243,10 @@ export interface FakeProviders {
   drafts: Array<{ threadId: string; to: string; subject: string; inReplyTo: string }>;
   geminiClassification: GeminiClassification;
   geminiCalls: number;
+  /** What the fake Gemini returns for a resume-parsing prompt. */
+  parsedResume: Record<string, unknown>;
+  /** Files users sent the bot, by Telegram file_id. */
+  telegramFiles: Record<string, Buffer>;
   /** Tokens Google was asked to revoke, exactly as received. */
   revokedTokens: string[];
   /** Every messages.send request Gmail received, whatever it answered. */
@@ -269,6 +273,19 @@ export async function startFakeProviders(): Promise<FakeProviders> {
     summary: 'The recruiter asks for a call.',
     suggested_action: 'Reply with availability.',
   });
+  // The parser estimates years when unsure; the estimate must never count as confirmed.
+  const defaultParsedResume = (): Record<string, unknown> => ({
+    identity: { name: 'Ada Synthetic', email: 'ada@example.test', phone: '', location: 'Lagos', links: { github: '', linkedin: '', portfolio: '' } },
+    years_experience: 4,
+    open_to_relocation: false,
+    education: [],
+    certs: [],
+    experience: [],
+    projects: [],
+    skills: { strong: ['TypeScript', 'Postgres'], working: [], known_gaps: [] },
+    fixed_priority: [],
+    gap_framing: '',
+  });
   const defaultGrant = (): OAuthGrant => ({ scope: FULL_GMAIL_SCOPE, emailAddress: 'candidate@gmail.com', withRefreshToken: true });
   const state: FakeProviders = {
     oauthGrant: defaultGrant(),
@@ -278,6 +295,8 @@ export async function startFakeProviders(): Promise<FakeProviders> {
     drafts: [],
     geminiClassification: defaultClassification(),
     geminiCalls: 0,
+    parsedResume: defaultParsedResume(),
+    telegramFiles: {},
     revokedTokens: [],
     sendRequests: 0,
     sent: [],
@@ -295,6 +314,8 @@ export async function startFakeProviders(): Promise<FakeProviders> {
       state.drafts = [];
       state.geminiClassification = defaultClassification();
       state.geminiCalls = 0;
+      state.parsedResume = defaultParsedResume();
+      state.telegramFiles = {};
       state.revokedTokens = [];
       state.sendRequests = 0;
       state.sent = [];
@@ -426,7 +447,9 @@ export async function startFakeProviders(): Promise<FakeProviders> {
       const prompt: string = JSON.parse(body).contents?.[0]?.parts?.[0]?.text ?? '';
       const answer = prompt.includes('Categorize this message')
         ? state.geminiClassification
-        : { reply_body: 'Thank you for reaching out. I am available for a call. [Insert your preferred times here]', availability_placeholder_used: true };
+        : prompt.includes('resume parser')
+          ? state.parsedResume
+          : { reply_body: 'Thank you for reaching out. I am available for a call. [Insert your preferred times here]', availability_placeholder_used: true };
       return json(res, 200, {
         candidates: [{ content: { role: 'model', parts: [{ text: JSON.stringify(answer) }] }, finishReason: 'STOP' }],
       });
@@ -458,6 +481,18 @@ export async function startFakeProviders(): Promise<FakeProviders> {
       }
       state.telegram.push({ chatId: message.chat_id, text: message.text });
       return json(res, 200, { ok: true, result: {} });
+    }
+
+    if (req.method === 'GET' && url.pathname === `/bot${BOT_TOKEN}/getFile`) {
+      const fileId = url.searchParams.get('file_id') ?? '';
+      if (!state.telegramFiles[fileId]) return json(res, 400, { ok: false, description: 'Bad Request: file not found' });
+      return json(res, 200, { ok: true, result: { file_id: fileId, file_path: `documents/${fileId}` } });
+    }
+
+    const fileMatch = new RegExp(`^/file/bot${BOT_TOKEN}/documents/(.+)$`).exec(url.pathname);
+    if (req.method === 'GET' && fileMatch && state.telegramFiles[fileMatch[1]]) {
+      res.writeHead(200, { 'content-type': 'application/octet-stream' });
+      return res.end(state.telegramFiles[fileMatch[1]]);
     }
 
     if (req.method === 'POST' && url.pathname === `/bot${BOT_TOKEN}/sendDocument`) {
@@ -619,6 +654,22 @@ export async function sendTelegramCommand(chatId: number, text: string): Promise
   if (status !== 200) {
     throw new Error(`Telegram webhook answered ${status}`);
   }
+}
+
+/** Posts a document message, as Telegram does when a user sends a file. Returns the HTTP status. */
+export async function sendTelegramDocumentUpdate(
+  chatId: number,
+  document: { file_id: string; file_name: string; file_size: number }
+): Promise<number> {
+  return postTelegramUpdate({
+    update_id: nextUpdateId++,
+    message: {
+      message_id: nextUpdateId,
+      from: { id: chatId, first_name: 'Synthetic' },
+      chat: { id: chatId, type: 'private' },
+      document,
+    },
+  });
 }
 
 /** Replies the bot sent to one chat, oldest first. */

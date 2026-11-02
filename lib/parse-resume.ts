@@ -7,6 +7,8 @@ import { MasterFacts, MasterFactsSchema } from './schemas';
 const apiKey = process.env.GEMINI_API_KEY || '';
 const modelName = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
 const genAI = new GoogleGenerativeAI(apiKey);
+// E2E only: point Gemini calls at a fake server. Unset in every real environment.
+const geminiRequestOptions = process.env.GEMINI_API_BASE_URL ? { baseUrl: process.env.GEMINI_API_BASE_URL } : undefined;
 
 export interface ResumeValidationResult {
   valid: boolean;
@@ -138,13 +140,16 @@ Important Rules:
   for (const modelId of candidateModels) {
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const model = genAI.getGenerativeModel({
-          model: modelId,
-          generationConfig: {
-            responseMimeType: 'application/json',
-            temperature: 0.1,
+        const model = genAI.getGenerativeModel(
+          {
+            model: modelId,
+            generationConfig: {
+              responseMimeType: 'application/json',
+              temperature: 0.1,
+            },
           },
-        });
+          geminiRequestOptions
+        );
 
         const result = await model.generateContent(prompt);
         const text = result.response.text();

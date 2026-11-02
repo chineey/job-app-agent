@@ -2,7 +2,7 @@
 
 Everything Dev B owns (platform, Telegram, Gmail, sending and the safety around it), written as goals, each with the E2E suite that proves it. Status as of 2 November 2026.
 
-Every goal's suite was checked by reintroducing the original defects and confirming the scenario fails; the linked documents list each one. `npm run check` runs the whole gate (types, unit tests, production build, 50 E2E scenarios), and CI runs it on every pull request.
+Every goal's suite was checked by reintroducing the original defects and confirming the scenario fails; the linked documents list each one. `npm run check` runs the whole gate (types, unit tests, production build, 56 E2E scenarios), and CI runs it on every pull request.
 
 ## Done
 
@@ -20,6 +20,7 @@ Every goal's suite was checked by reintroducing the original defects and confirm
 | G6. Settings and admin commands are complete and validated | `commands.md` | `commands` |
 | G7. One application's error does not stop the send pass; chats are rate limited; old update ids are pruned; `/delete_me` deletes events | `commands.md`, `telegram-access.md` | `commands`, `telegram-access` |
 | G8. CI runs the full gate on every pull request | `.github/workflows/ci.yml` | all |
+| G9. Resume onboarding: uploads checked before parsing, one pending and one active version, `/accept` needs confirmed years, `/set` never edits the active version, `/accept` and `/rollback` re-queue unsent work, uploaded mode needs a stored PDF | `resume-onboarding.md` | `resume-onboarding` |
 
 ## Needs a decision with Dev A
 
@@ -30,6 +31,9 @@ These cross the Dev A / Dev B boundary, so they are proposals, not work Dev B sh
 - **Reply drafts and the truth verifier.** The spec asks for Dev A's verifier to check reply drafts; they are only drafts today.
 - **Bounce retry to a second address** (spec section 13) needs Dev A to extract and store alternate addresses.
 - **Resume file deletion on `/delete_me`.** Dev A's pipeline writes the files to Vercel Blob; agree which side deletes them.
+- **Storing uploaded PDFs** privately (spec: private Blob path). Until then uploaded resume mode is refused.
+- **Intermittent PDF rejection.** Dev A's validator sometimes rejected a valid PDF with "bad XRef entry" in some builds (`resume-onboarding.md`).
+- **Re-queue scope.** Whether `matched` and unsent `link_ready` applications should also regenerate when facts change.
 - **Manual post ingest.** Pasting a post URL triggers processing but never ingests the post.
 - **Testing policy.** `AGENTS.md` (E2E first) is not on `master`, while `master` has vitest unit tests. CI now runs both.
 - **Dev A code flagged during review.** The ingest and process cron routes use Next's fetch cache (X searches can be a year stale), and `scripts/pipeline.js` has a hardcoded `CRON_SECRET`.

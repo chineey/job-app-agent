@@ -18,6 +18,15 @@ import { resolveSendAttempt, runSendPass } from './send';
 import { IMPORT_LIMIT, importPastRecipients, openDrafts, recentSends, skipApplication } from './applications';
 import { capCeiling, sendCap, stageCap } from './ramp';
 import { markLinkApplied, waitingLinkApplications } from './links';
+import {
+  acceptPendingVersion,
+  activeYearsConfirmed,
+  rejectPendingVersion,
+  rollbackVersion,
+  setFact,
+  setResumeMode,
+  storePendingVersion,
+} from './facts-versions';
 import { disconnectGmail, type DisconnectResult } from './gmail';
 import { validateUploadedPdf, extractResumeText, parseResumeTextToFacts } from './parse-resume';
 import { mergeWithActiveFacts, computeFactsDiff } from './facts';
@@ -28,6 +37,7 @@ const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID ? parseInt(process.env.ADMIN_CHA
 const APP_BASE_URL = process.env.APP_BASE_URL || 'http://localhost:3000';
 // Hard daily ceiling on X reads (spec: X_MAX_DAILY_READS, default 300); admin overrides stay within it.
 const X_MAX_DAILY_READS = parseInt(process.env.X_MAX_DAILY_READS || '300', 10);
+const MAX_RESUME_BYTES = 5 * 1024 * 1024;
 const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // E2E only: point Bot API calls at a fake server. Unset in every real environment.
 const TELEGRAM_API_BASE_URL = process.env.TELEGRAM_API_BASE_URL || 'https://api.telegram.org';
@@ -368,7 +378,8 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
 
         const hasGmail = user.gmail_status === 'connected';
         const hasFacts = activeFacts.length > 0;
-        const hasYears = (activeFacts[0]?.facts?.years_experience || 0) > 0;
+        // Confirmed by the user with /set years; the parser's estimate does not count.
+        const hasYears = await activeYearsConfirmed(user.id);
         const has5Drafts = settings.dry_run_drafts_shown >= 5;
 
         if (!hasGmail || !hasFacts || !hasYears || !has5Drafts) {
@@ -490,86 +501,51 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
     }
 
     case '/accept': {
-      const pendingRows = (await sql`
-        select * from facts_versions
-        where user_id = ${user.id} and status = 'pending'
-        order by created_at desc limit 1;
-      `) as Array<{ id: number; facts: MasterFacts }>;
-
-      if (pendingRows.length === 0) {
+      const result = await acceptPendingVersion(user.id);
+      if (result.outcome === 'no_pending') {
         await sendTelegramMessage(chatId, '⚠️ No pending facts version to accept. Please upload your resume first.');
         return;
       }
-
-      const pending = pendingRows[0];
-      if (!pending.facts.years_experience || pending.facts.years_experience <= 0) {
+      if (result.outcome === 'years_unconfirmed') {
         await sendTelegramMessage(
           chatId,
-          '⚠️ Please specify your professional software engineering experience first:\n`/set years <number>`\nThen type `/accept`.'
+          '⚠️ Please confirm your professional software engineering experience first:\n`/set years <number>`\nThen type `/accept`.'
         );
         return;
       }
-
-      // Supersede previous active version
-      await sql`
-        update facts_versions
-        set status = 'superseded'
-        where user_id = ${user.id} and status = 'active';
-      `;
-
-      // Activate pending version
-      await sql`
-        update facts_versions
-        set status = 'active'
-        where id = ${pending.id};
-      `;
-
-      // Reset unsent applications to queued to regenerate with new facts
-      await sql`
-        update applications
-        set status = 'queued', updated_at = now()
-        where user_id = ${user.id} and status in ('drafted', 'verified', 'ready');
-      `;
-
-      await logEvent(user.id, 'facts_version_accepted', { versionId: pending.id });
+      const { facts } = result;
       await sendTelegramMessage(
         chatId,
         `✅ *Master Facts Accepted and Activated!*\n\n` +
-          `• Name: ${pending.facts.identity.name}\n` +
-          `• Experience: ${pending.facts.years_experience} years\n` +
-          `• Relocation: ${pending.facts.open_to_relocation ? 'Yes' : 'No'}\n` +
-          `• Strong Skills: ${pending.facts.skills.strong.slice(0, 8).join(', ')}\n\n` +
-          `Your applications will now be tailored against this verified profile.`
+          `• Name: ${facts.identity.name}\n` +
+          `• Experience: ${facts.years_experience} years\n` +
+          `• Relocation: ${facts.open_to_relocation ? 'Yes' : 'No'}\n` +
+          `• Strong Skills: ${facts.skills.strong.slice(0, 8).join(', ')}\n\n` +
+          `Your applications will now be tailored against this verified profile` +
+          (result.requeued > 0 ? ` (${result.requeued} unsent application(s) will be regenerated).` : '.') +
+          (result.switchedToGenerated ? `\n\nThis version has no stored PDF, so your resume mode is back to \`generated\`.` : '')
       );
       break;
     }
 
     case '/reject': {
-      await sql`
-        update facts_versions
-        set status = 'rejected'
-        where user_id = ${user.id} and status = 'pending';
-      `;
-      await sendTelegramMessage(chatId, '❌ Proposed resume facts discarded.');
+      const rejected = await rejectPendingVersion(user.id);
+      await sendTelegramMessage(chatId, rejected ? '❌ Proposed resume facts discarded.' : 'There is no pending facts version to discard.');
       break;
     }
 
     case '/rollback': {
-      const pastActive = (await sql`
-        select * from facts_versions
-        where user_id = ${user.id} and status = 'superseded'
-        order by created_at desc limit 1;
-      `) as Array<{ id: number }>;
-
-      if (pastActive.length === 0) {
+      const result = await rollbackVersion(user.id);
+      if (result.outcome === 'nothing_to_roll_back') {
         await sendTelegramMessage(chatId, '⚠️ No previous facts version available to roll back to.');
         return;
       }
-
-      await sql`update facts_versions set status = 'superseded' where user_id = ${user.id} and status = 'active';`;
-      await sql`update facts_versions set status = 'active' where id = ${pastActive[0].id};`;
-
-      await sendTelegramMessage(chatId, `⏪ Rolled back to previous facts version (ID: ${pastActive[0].id}).`);
+      await sendTelegramMessage(
+        chatId,
+        `⏪ Rolled back to previous facts version (ID: ${result.versionId}).` +
+          (result.requeued > 0 ? ` ${result.requeued} unsent application(s) will be regenerated.` : '') +
+          (result.switchedToGenerated ? `\n\nThat version has no stored PDF, so your resume mode is back to \`generated\`.` : '')
+      );
       break;
     }
 
@@ -577,45 +553,29 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
       const field = args[0]?.toLowerCase();
       const val = args.slice(1).join(' ').trim();
 
-      const targetVersion = (await sql`
-        select * from facts_versions
-        where user_id = ${user.id} and status in ('pending', 'active')
-        order by case when status = 'pending' then 1 else 2 end, created_at desc
-        limit 1;
-      `) as Array<{ id: number; facts: MasterFacts; status: string }>;
-
-      if (targetVersion.length === 0) {
-        await sendTelegramMessage(chatId, '⚠️ Please upload a resume first before setting attributes.');
-        return;
-      }
-
-      const current = targetVersion[0];
-      const updatedFacts = { ...current.facts };
-
+      let change: ((facts: MasterFacts) => MasterFacts) | null = null;
+      let confirmation = '';
       if (field === 'years') {
-        const num = parseInt(val, 10);
-        if (isNaN(num) || num < 0) {
+        const num = /^\d+$/.test(val) ? parseInt(val, 10) : NaN;
+        if (isNaN(num) || num > 60) {
           await sendTelegramMessage(chatId, 'Usage: `/set years <number>` (e.g. `/set years 4`)');
           return;
         }
-        updatedFacts.years_experience = num;
-        await sendTelegramMessage(chatId, `✅ Experience set to ${num} years.`);
-      } else if (field === 'relocation') {
-        const isRelo = ['yes', 'true', '1', 'y'].includes(val.toLowerCase());
-        updatedFacts.open_to_relocation = isRelo;
-        await sendTelegramMessage(chatId, `✅ Open to relocation set to: ${isRelo ? 'Yes' : 'No'}.`);
-      } else if (field === 'framing') {
-        if (!val) {
-          await sendTelegramMessage(chatId, 'Usage: `/set framing <sentence>`');
-          return;
-        }
-        updatedFacts.gap_framing = val;
-        await sendTelegramMessage(chatId, `✅ Gap framing sentence updated:\n"${val}"`);
+        change = (facts) => ({ ...facts, years_experience: num });
+        confirmation = `✅ Experience set to ${num} years.`;
+      } else if (field === 'relocation' && ['yes', 'no'].includes(val.toLowerCase())) {
+        const isRelo = val.toLowerCase() === 'yes';
+        change = (facts) => ({ ...facts, open_to_relocation: isRelo });
+        confirmation = `✅ Open to relocation set to: ${isRelo ? 'Yes' : 'No'}.`;
+      } else if (field === 'framing' && val) {
+        change = (facts) => ({ ...facts, gap_framing: val });
+        confirmation = `✅ Gap framing sentence updated:\n"${val}"`;
       } else if (field === 'gaps') {
         const gapsList = val.split(',').map((g) => g.trim()).filter(Boolean);
-        updatedFacts.skills.known_gaps = gapsList;
-        await sendTelegramMessage(chatId, `✅ Known gaps updated: ${gapsList.join(', ')}`);
-      } else {
+        change = (facts) => ({ ...facts, skills: { ...facts.skills, known_gaps: gapsList } });
+        confirmation = `✅ Known gaps updated: ${gapsList.join(', ') || '(none)'}`;
+      }
+      if (!change) {
         await sendTelegramMessage(
           chatId,
           `Usage:\n• \`/set years <N>\`\n• \`/set relocation yes|no\`\n• \`/set framing <text>\`\n• \`/set gaps <a, b, c>\``
@@ -623,15 +583,13 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
         return;
       }
 
-      await sql`
-        update facts_versions
-        set facts = ${JSON.stringify(updatedFacts)}
-        where id = ${current.id};
-      `;
-
-      if (current.status === 'pending') {
-        await sendTelegramMessage(chatId, 'Type `/accept` to lock in these changes.');
+      const result = await setFact(user.id, change, field === 'years');
+      if (result.outcome === 'no_facts') {
+        await sendTelegramMessage(chatId, '⚠️ Please upload a resume first before setting attributes.');
+        return;
       }
+      // Nothing the verifier trusts changes until /accept, including edits to an already active profile.
+      await sendTelegramMessage(chatId, `${confirmation}\nType \`/accept\` to lock in these changes.`);
       break;
     }
 
@@ -647,14 +605,25 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
         );
         return;
       }
-
       if (mode !== 'generated' && mode !== 'uploaded') {
         await sendTelegramMessage(chatId, 'Usage: `/resumemode generated` or `/resumemode uploaded`');
         return;
       }
 
-      await updateUserSettings(user.id, { resume_mode: mode });
-      await sendTelegramMessage(chatId, `✅ Resume mode updated to: \`${mode}\`.`);
+      const result = await setResumeMode(user.id, mode);
+      if (result.outcome === 'no_stored_pdf') {
+        await sendTelegramMessage(
+          chatId,
+          '❌ Uploaded mode needs an accepted resume with a stored PDF. Send your resume as a PDF, `/accept` it, then try again.'
+        );
+        return;
+      }
+      await sendTelegramMessage(
+        chatId,
+        result.outcome === 'unchanged'
+          ? `Resume mode is already \`${mode}\`.`
+          : `✅ Resume mode updated to: \`${mode}\`.` + (result.requeued > 0 ? ` ${result.requeued} unsent application(s) will be regenerated.` : '')
+      );
       break;
     }
 
@@ -785,16 +754,18 @@ export async function handleTelegramDocument(
   displayName?: string
 ): Promise<void> {
   const user = await getUserByChatId(chatId);
-  if (!user || user.status === 'pending' || user.status === 'suspended') {
+  if (!user || user.status !== 'active') {
     await sendTelegramMessage(chatId, '⚠️ Please accept the privacy notice with `/agree` first before uploading a resume.');
     return;
   }
 
-  const fileName = document.file_name || 'resume.pdf';
-  const isPdf = fileName.toLowerCase().endsWith('.pdf');
-  const isDocx = fileName.toLowerCase().endsWith('.docx');
-
-  if (!isPdf && !isDocx) {
+  // Spec: files over about 5 MB or of other types are rejected before anything is downloaded or parsed.
+  if ((document.file_size ?? 0) > MAX_RESUME_BYTES) {
+    await sendTelegramMessage(chatId, '❌ That file is over 5 MB. Please send a smaller PDF or Word file.');
+    return;
+  }
+  const fileName = (document.file_name || '').toLowerCase();
+  if (!fileName.endsWith('.pdf') && !fileName.endsWith('.docx')) {
     await sendTelegramMessage(chatId, '❌ Unsupported file format. Please upload your resume as a `.pdf` or `.docx` document.');
     return;
   }
@@ -813,6 +784,14 @@ export async function handleTelegramDocument(
     const downloadRes = await fetch(`${TELEGRAM_API_BASE_URL}/file/bot${TELEGRAM_BOT_TOKEN}/${fileData.result.file_path}`);
     const arrayBuf = await downloadRes.arrayBuffer();
     const buffer = Buffer.from(arrayBuf);
+
+    // The name says nothing about the bytes: decide by content (PDF header, or a Word file's zip header).
+    const isPdf = buffer.subarray(0, 5).toString('latin1') === '%PDF-';
+    const isDocx = !isPdf && buffer.subarray(0, 4).equals(Buffer.from([0x50, 0x4b, 0x03, 0x04]));
+    if (buffer.length > MAX_RESUME_BYTES || (!isPdf && !isDocx)) {
+      await sendTelegramMessage(chatId, '❌ That file is not a PDF or Word document under 5 MB.');
+      return;
+    }
 
     let pageCount: number | undefined;
     let sha256Hex: string | undefined;
@@ -838,7 +817,6 @@ export async function handleTelegramDocument(
     const activeFactsRows = (await sql`
       select facts from facts_versions
       where user_id = ${user.id} and status = 'active'
-      limit 1;
     `) as Array<{ facts: MasterFacts }>;
 
     const activeFacts = activeFactsRows[0]?.facts || null;
@@ -851,17 +829,13 @@ export async function handleTelegramDocument(
       diff.experience_changes.length > 0 ? `Roles: ${diff.experience_changes.join('; ')}` : '',
     ].filter(Boolean).join('\n');
 
-    const insertRes = (await sql`
-      insert into facts_versions (
-        user_id, source, facts, diff_summary, source_file_pages, source_file_sha256, status
-      ) values (
-        ${user.id}, 'telegram_upload', ${JSON.stringify(mergedFacts)}, ${diffSummaryText},
-        ${pageCount || null}, ${sha256Hex || null}, 'pending'
-      )
-      returning id;
-    `) as Array<{ id: number }>;
-
-    await logEvent(user.id, 'resume_uploaded_and_parsed', { versionId: insertRes[0].id, isPdf });
+    // Replaces any older pending version. The PDF itself is not stored yet (see docs/resume-onboarding.md).
+    await storePendingVersion(
+      user.id,
+      mergedFacts,
+      diffSummaryText,
+      sha256Hex && pageCount ? { sha256: sha256Hex, pages: pageCount } : null
+    );
 
     // 8. Send summary to user
     await sendTelegramMessage(
@@ -875,14 +849,13 @@ export async function handleTelegramDocument(
         `*Projects Found:* ${mergedFacts.projects.length}\n` +
         `*Strong Skills:* ${mergedFacts.skills.strong.slice(0, 10).join(', ')}\n\n` +
         `👉 *Next Steps to Activate:*\n` +
-        `1. Set your professional years of experience: \`/set years <N>\`\n` +
+        `1. Confirm your professional years of experience: \`/set years <N>\`\n` +
         `2. (Optional) Set relocation: \`/set relocation yes|no\`\n` +
         `3. When ready, approve this profile: \`/accept\``
     );
   } catch (err: unknown) {
-    const errorMsg = err instanceof Error ? err.message : String(err);
     console.error('Error handling resume upload:', err);
-    await sendTelegramMessage(chatId, `❌ Failed to parse resume: ${errorMsg}`);
+    await sendTelegramMessage(chatId, '❌ Failed to read your resume. Please try again, or send it in the other format.');
   }
 }
 
