@@ -29,6 +29,10 @@ The Telegram commands not covered by the other documents: running a pass early, 
 - Pasting a post URL triggers processing but does not ingest the post: manual ingest belongs to Dev A's pipeline.
 - `/admin threads` uses the X read limit as its ceiling because the spec gives no separate one.
 
+## Proof the suite detects these bugs
+
+Reintroduced and confirmed failing: `/skip` regardless of status, and the send loop without per-application isolation (the whole cron answered 500). The user `/run` scenario was not mutated, because the old behaviour would call the real X API.
+
 ## Running
 
 These scenarios are in `e2e/commands.e2e.mts` and run with the rest of the suite (`npm run build && npm run test:e2e`).

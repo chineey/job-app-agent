@@ -34,6 +34,10 @@ The inbox cron reads each user's bounce notices and the threads their applicatio
 - Reply drafts are not checked by Dev A's truth verifier (the spec asks for it); they are drafts the user reviews, never sent.
 - The spec's bounce retry to a second address needs alternate addresses from Dev A's extraction; a bounce ends at `bounced`.
 
+## Proof the suite detects these bugs
+
+Reintroduced and confirmed failing: handling the same message on every scan, blaming a later send for an old bounce, follow-ups for suspended users, and no plain-text fallback (checked on its own: the reply alert was lost).
+
 ## Running
 
 These scenarios are in `e2e/inbox-and-drafts.e2e.mts` and run with the rest of the suite (`npm run build && npm run test:e2e`). Gemini is replaced by a fake via `GEMINI_API_BASE_URL`, which must stay unset in every real environment.

@@ -21,6 +21,10 @@ When a job asks applicants to use a link or form, the agent never opens or fills
 | 4 | Deadline approaching | No reminder | One reminder | Reminder scenario |
 | 5 | `/links` | Not implemented | Lists waiting applications | `/links` scenario |
 
+## Proof the suite detects these bugs
+
+Reintroduced and confirmed failing: `/done` on any of the user's applications.
+
 ## Running
 
 These scenarios are in `e2e/link-applications.e2e.mts` and run with the rest of the suite (`npm run build && npm run test:e2e`).
