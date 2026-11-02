@@ -245,6 +245,14 @@ export interface FakeProviders {
   geminiCalls: number;
   /** What the fake Gemini returns for a resume-parsing prompt. */
   parsedResume: Record<string, unknown>;
+  /** What the fake Gemini returns for each of Dev A's pipeline stages. */
+  pipeline: { extract: Record<string, unknown>; match: Record<string, unknown>; tailor: Record<string, unknown>; verify: Record<string, unknown> };
+  /** Posts the fake X recent search returns, newest first. */
+  xPosts: Array<{ id: string; text: string; author_id: string; conversation_id: string }>;
+  /** Every X search request: its query parameters. */
+  xSearches: Array<Record<string, string>>;
+  /** Files stored in the fake Blob store, by pathname. */
+  blobs: Record<string, Buffer>;
   /** Files users sent the bot, by Telegram file_id. */
   telegramFiles: Record<string, Buffer>;
   /** Tokens Google was asked to revoke, exactly as received. */
@@ -286,6 +294,44 @@ export async function startFakeProviders(): Promise<FakeProviders> {
     fixed_priority: [],
     gap_framing: '',
   });
+  // A clean, low-risk email job that every stage accepts; scenarios override single stages.
+  const defaultPipeline = (): FakeProviders['pipeline'] => ({
+    extract: {
+      transcribed_text: '',
+      is_job: true,
+      is_software_role: true,
+      role: 'Backend Engineer',
+      company: 'Acme',
+      location: 'Remote',
+      remote: true,
+      relocation_required: false,
+      visa_sponsorship: 'unknown',
+      min_years: 2,
+      salary: null,
+      deadline: null,
+      requirements: ['TypeScript', 'Postgres'],
+      apply_method: 'email',
+      scam_risk: 'low',
+      scam_reasons: [],
+    },
+    match: { fit_score: 82, gaps: [], years_gap: false, explanation: 'Strong TypeScript and Postgres fit.' },
+    tailor: {
+      resume_json: {
+        summary_line: 'Backend engineer building TypeScript and Postgres services.',
+        project_ids: ['p1'],
+        bullet_ids: ['p1-b1'],
+        skill_order: ['TypeScript', 'Postgres'],
+      },
+      email_slots: {
+        subject: 'Application: Backend Engineer at Acme',
+        opening_line: 'I am applying for the Backend Engineer role at Acme.',
+        project_fit_sentences: 'I built a payments API in TypeScript and Postgres that handles retries safely.',
+        gap_sentence: '',
+      },
+      cover_note: 'I would love to help Acme build reliable backend services.',
+    },
+    verify: { supported: true, unsupported_claims: [] },
+  });
   const defaultGrant = (): OAuthGrant => ({ scope: FULL_GMAIL_SCOPE, emailAddress: 'candidate@gmail.com', withRefreshToken: true });
   const state: FakeProviders = {
     oauthGrant: defaultGrant(),
@@ -296,6 +342,10 @@ export async function startFakeProviders(): Promise<FakeProviders> {
     geminiClassification: defaultClassification(),
     geminiCalls: 0,
     parsedResume: defaultParsedResume(),
+    pipeline: defaultPipeline(),
+    xPosts: [],
+    xSearches: [],
+    blobs: {},
     telegramFiles: {},
     revokedTokens: [],
     sendRequests: 0,
@@ -315,6 +365,10 @@ export async function startFakeProviders(): Promise<FakeProviders> {
       state.geminiClassification = defaultClassification();
       state.geminiCalls = 0;
       state.parsedResume = defaultParsedResume();
+      state.pipeline = defaultPipeline();
+      state.xPosts = [];
+      state.xSearches = [];
+      state.blobs = {};
       state.telegramFiles = {};
       state.revokedTokens = [];
       state.sendRequests = 0;
@@ -334,7 +388,8 @@ export async function startFakeProviders(): Promise<FakeProviders> {
 
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', FAKE_URL);
-    const body = await readBody(req);
+    const rawBody = await readBody(req);
+    const body = rawBody.toString('utf8');
 
     if (req.method === 'POST' && url.pathname === '/oauth/token') {
       const form = new URLSearchParams(body);
@@ -449,7 +504,15 @@ export async function startFakeProviders(): Promise<FakeProviders> {
         ? state.geminiClassification
         : prompt.includes('resume parser')
           ? state.parsedResume
-          : { reply_body: 'Thank you for reaching out. I am available for a call. [Insert your preferred times here]', availability_placeholder_used: true };
+          : prompt.includes('ATS extractor')
+            ? state.pipeline.extract
+            : prompt.includes('objective hiring manager')
+              ? state.pipeline.match
+              : prompt.includes('tailoring an engineering application')
+                ? state.pipeline.tailor
+                : prompt.includes('adversarial fact-checker')
+                  ? state.pipeline.verify
+                  : { reply_body: 'Thank you for reaching out. I am available for a call. [Insert your preferred times here]', availability_placeholder_used: true };
       return json(res, 200, {
         candidates: [{ content: { role: 'model', parts: [{ text: JSON.stringify(answer) }] }, finishReason: 'STOP' }],
       });
@@ -481,6 +544,30 @@ export async function startFakeProviders(): Promise<FakeProviders> {
       }
       state.telegram.push({ chatId: message.chat_id, text: message.text });
       return json(res, 200, { ok: true, result: {} });
+    }
+
+    if (req.method === 'GET' && url.pathname === '/x/2/tweets/search/recent') {
+      state.xSearches.push(Object.fromEntries(url.searchParams));
+      const sinceId = url.searchParams.get('since_id');
+      // Thread expansion searches by conversation; the scenarios have no threads.
+      const posts = (url.searchParams.get('query') ?? '').includes('conversation_id:')
+        ? []
+        : state.xPosts.filter((post) => !sinceId || BigInt(post.id) > BigInt(sinceId));
+      return json(res, 200, { data: posts, includes: { media: [], users: [] }, meta: { result_count: posts.length } });
+    }
+
+    if (req.method === 'PUT' && url.pathname === '/blob/') {
+      const pathname = url.searchParams.get('pathname') ?? '';
+      state.blobs[pathname] = rawBody;
+      const fileUrl = `${FAKE_URL}/blobfiles/${pathname}`;
+      return json(res, 200, { url: fileUrl, downloadUrl: fileUrl, pathname, contentType: 'application/pdf', contentDisposition: 'inline' });
+    }
+
+    if (req.method === 'GET' && url.pathname.startsWith('/blobfiles/')) {
+      const stored = state.blobs[url.pathname.slice('/blobfiles/'.length)];
+      if (!stored) return json(res, 404, { error: 'not found' });
+      res.writeHead(200, { 'content-type': 'application/pdf' });
+      return res.end(stored);
     }
 
     if (req.method === 'GET' && url.pathname === `/bot${BOT_TOKEN}/getFile`) {
@@ -525,10 +612,10 @@ function header(raw: string, name: string): string {
   return match ? match[1].trim() : '';
 }
 
-async function readBody(req: IncomingMessage): Promise<string> {
+async function readBody(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
   for await (const chunk of req) chunks.push(chunk as Buffer);
-  return Buffer.concat(chunks).toString('utf8');
+  return Buffer.concat(chunks);
 }
 
 function json(res: ServerResponse, status: number, payload: unknown): void {
@@ -564,6 +651,10 @@ export async function startApp(databaseUrl: string, env: Record<string, string |
       GOOGLE_API_ROOT_URL: `${FAKE_URL}/`,
       GOOGLE_OAUTH_ROOT_URL: `${FAKE_URL}/oauth`,
       GEMINI_API_KEY: 'e2e-gemini-key',
+      X_BEARER_TOKEN: 'e2e-x-token',
+      X_API_BASE_URL: `${FAKE_URL}/x`,
+      BLOB_READ_WRITE_TOKEN: 'vercel_blob_rw_e2estore_secret',
+      VERCEL_BLOB_API_URL: `${FAKE_URL}/blob`,
       GEMINI_API_BASE_URL: `${FAKE_URL}/gemini`,
       TOKEN_ENCRYPTION_KEY: ENCRYPTION_KEY.toString('base64'),
       ...env,
@@ -606,7 +697,7 @@ export async function getApp(pathAndQuery: string, headers: Record<string, strin
   return fetch(`${APP_URL}${pathAndQuery}`, { headers, redirect: 'manual' });
 }
 
-export async function runCron(name: 'send' | 'summary' | 'inbox' | 'followups'): Promise<Record<string, unknown>> {
+export async function runCron(name: 'send' | 'summary' | 'inbox' | 'followups' | 'ingest' | 'process'): Promise<Record<string, unknown>> {
   const res = await fetch(`${APP_URL}/api/cron/${name}`, { headers: { authorization: `Bearer ${CRON_SECRET}` } });
   const body = (await res.json()) as Record<string, unknown>;
   if (res.status !== 200) {

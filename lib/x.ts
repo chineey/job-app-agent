@@ -1,6 +1,8 @@
 import { sql } from './db';
 
 const X_BEARER_TOKEN = process.env.X_BEARER_TOKEN || '';
+// E2E only: point X API calls at a fake server. Unset in every real environment.
+const X_API_BASE_URL = process.env.X_API_BASE_URL || 'https://api.twitter.com';
 const READ_COST_PER_POST = 0.005; // ~$0.005 per read on X v2 API
 
 export interface XMedia {
@@ -44,7 +46,7 @@ export async function searchRecentJobPosts(
 
   const query = '("hiring" OR "we are hiring" OR "send your CV" OR "send your resume" OR "apply via email") (developer OR engineer OR "full stack" OR backend OR frontend OR "AI engineer" OR devops OR "software") -is:retweet -is:reply lang:en';
 
-  const url = new URL('https://api.twitter.com/2/tweets/search/recent');
+  const url = new URL(`${X_API_BASE_URL}/2/tweets/search/recent`);
   url.searchParams.set('query', query);
   url.searchParams.set('max_results', Math.min(Math.max(maxResults, 10), 100).toString());
   url.searchParams.set('tweet.fields', 'conversation_id,author_id,in_reply_to_user_id,referenced_tweets,created_at,attachments');
@@ -113,7 +115,7 @@ export async function expandAuthorThread(
 ): Promise<{ threadText: string; mediaUrls: string[]; threadPostIds: string[] }> {
   const query = `conversation_id:${conversationId} from:${authorUsername} -is:retweet`;
 
-  const url = new URL('https://api.twitter.com/2/tweets/search/recent');
+  const url = new URL(`${X_API_BASE_URL}/2/tweets/search/recent`);
   url.searchParams.set('query', query);
   url.searchParams.set('max_results', Math.min(Math.max(maxPosts, 10), 100).toString());
   url.searchParams.set('tweet.fields', 'conversation_id,author_id,created_at,attachments');
@@ -168,7 +170,7 @@ export async function expandAuthorThread(
  * Fetches a single post for manual paste ingestion.
  */
 export async function fetchSinglePost(postId: string): Promise<{ tweet: XTweet; mediaUrls: string[]; authorUsername?: string } | null> {
-  const url = new URL(`https://api.twitter.com/2/tweets/${postId}`);
+  const url = new URL(`${X_API_BASE_URL}/2/tweets/${postId}`);
   url.searchParams.set('tweet.fields', 'conversation_id,author_id,created_at,attachments');
   url.searchParams.set('expansions', 'attachments.media_keys,author_id');
   url.searchParams.set('media.fields', 'url,preview_image_url,type');
