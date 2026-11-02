@@ -7,6 +7,17 @@ import { MasterFacts, MasterFactsSchema } from './schemas';
 const apiKey = process.env.GEMINI_API_KEY || '';
 const modelName = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
 const genAI = new GoogleGenerativeAI(apiKey);
+/**
+ * pdf-parse (pdf.js 1.10) copies its input with `new Buffer(...)`. For a Node Buffer that copy comes
+ * from Node's shared buffer pool, and pdf.js then misreads the file depending on where in the pool it
+ * lands: a production server rejected 17 of 30 uploads of the same valid PDF with "bad XRef entry".
+ * A plain Uint8Array is copied outside the pool and always reads correctly. The typings say Buffer;
+ * the library accepts any Uint8Array.
+ */
+function parsePdf(bytes: Buffer): ReturnType<typeof pdfParse> {
+  return pdfParse(new Uint8Array(bytes) as unknown as Buffer);
+}
+
 // E2E only: point Gemini calls at a fake server. Unset in every real environment.
 const geminiRequestOptions = process.env.GEMINI_API_BASE_URL ? { baseUrl: process.env.GEMINI_API_BASE_URL } : undefined;
 
@@ -55,7 +66,7 @@ export async function validateUploadedPdf(buffer: Buffer): Promise<ResumeValidat
 
   // 4. Parse text layer and verify page count & encryption
   try {
-    const data = await pdfParse(buffer);
+    const data = await parsePdf(buffer);
 
     if (data.numpages > 3) {
       return { valid: false, error: `PDF exceeds maximum allowed length of 3 pages (found ${data.numpages} pages)` };
@@ -86,7 +97,7 @@ export async function validateUploadedPdf(buffer: Buffer): Promise<ResumeValidat
  */
 export async function extractResumeText(buffer: Buffer, fileType: 'pdf' | 'docx'): Promise<string> {
   if (fileType === 'pdf') {
-    const data = await pdfParse(buffer);
+    const data = await parsePdf(buffer);
     return data.text;
   } else if (fileType === 'docx') {
     const result = await mammoth.extractRawText({ buffer });

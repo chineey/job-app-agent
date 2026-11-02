@@ -32,7 +32,7 @@ These cross the Dev A / Dev B boundary, so they are proposals, not work Dev B sh
 - **Bounce retry to a second address** (spec section 13) needs Dev A to extract and store alternate addresses.
 - **Resume file deletion on `/delete_me`.** Dev A's pipeline writes the files to Vercel Blob; agree which side deletes them.
 - **Storing uploaded PDFs** privately (spec: private Blob path). Until then uploaded resume mode is refused.
-- **Intermittent PDF rejection.** Dev A's validator sometimes rejected a valid PDF with "bad XRef entry" in some builds (`resume-onboarding.md`).
+- **PDF parsing fix in Dev A's file.** `pdf-parse` misread uploaded PDFs depending on Node's buffer pool (17 of 30 valid uploads rejected). `lib/parse-resume.ts` now passes a plain `Uint8Array`; Dev A should review (`resume-onboarding.md`).
 - **Re-queue scope.** Whether `matched` and unsent `link_ready` applications should also regenerate when facts change.
 - **Manual post ingest.** Pasting a post URL triggers processing but never ingests the post.
 - **Testing policy.** `AGENTS.md` (E2E first) is not on `master`, while `master` has vitest unit tests. CI now runs both.

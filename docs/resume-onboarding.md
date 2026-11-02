@@ -44,9 +44,13 @@ Reintroduced one at a time and confirmed failing:
 - uploaded mode without a stored PDF;
 - uploads without the size and content checks. This scenario asserts the checks' own rejection messages, so a later parser failure cannot make it pass.
 
-## Observed: valid PDFs intermittently rejected
+## Found and fixed: valid PDFs rejected depending on server memory
 
-In 3 of 7 production builds during this work, Dev A's PDF validator rejected the suite's valid one-page PDF with `PDF parsing error: bad XRef entry`. In one of those builds only an unrelated file differed. The same bytes parse correctly with `pdf-parse` directly, and four repeated runs on one clean build never failed. The cause is inside `pdf-parse` 1.1.1 as bundled by Next and has not been found. If it happens in production, users' valid resumes are rejected. It may also make CI fail intermittently.
+A production server rejected 17 of 30 uploads of the same valid PDF with `PDF parsing error: bad XRef entry`, which also failed CI once.
+
+**Cause.** `pdf-parse` (pdf.js 1.10) copies its input with `new Buffer(...)`. For a Node `Buffer`, that copy comes from Node's shared buffer pool, and pdf.js then misreads the file depending on where in the pool the copy lands. Reproduced outside the app by shifting the pool between parses: failures for a `Buffer`, none for a plain `Uint8Array`.
+
+**Fix.** `lib/parse-resume.ts` (Dev A's file) now passes a plain `Uint8Array`. The same 30 uploads were then all accepted, on two server runs.
 
 ## Running
 
