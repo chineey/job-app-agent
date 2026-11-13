@@ -57,7 +57,7 @@ export async function storePendingVersion(
   userId: string,
   facts: MasterFacts,
   diffSummary: string,
-  pdf: { sha256: string; pages: number } | null
+  pdf: { sha256: string; pages: number; url?: string | null } | null
 ): Promise<number> {
   assertUserScope(userId);
   const versionId = await withTransaction(async (tx) => {
@@ -65,8 +65,8 @@ export async function storePendingVersion(
     const active = await versionIn(tx, userId, 'active');
     await tx`update facts_versions set status = 'rejected' where user_id = ${userId} and status = 'pending'`;
     const [inserted] = (await tx`
-      insert into facts_versions (user_id, source, facts, diff_summary, source_file_sha256, source_file_pages, years_confirmed, status)
-      values (${userId}, 'telegram_upload', ${JSON.stringify(facts)}, ${diffSummary}, ${pdf?.sha256 ?? null},
+      insert into facts_versions (user_id, source, facts, diff_summary, source_file_url, source_file_sha256, source_file_pages, years_confirmed, status)
+      values (${userId}, 'telegram_upload', ${JSON.stringify(facts)}, ${diffSummary}, ${pdf?.url ?? null}, ${pdf?.sha256 ?? null},
               ${pdf?.pages ?? null}, ${active?.years_confirmed ?? false}, 'pending')
       returning id
     `) as Array<{ id: number }>;
@@ -91,6 +91,9 @@ export async function acceptPendingVersion(userId: string): Promise<AcceptResult
 
     await tx`update facts_versions set status = 'superseded' where user_id = ${userId} and status = 'active'`;
     await tx`update facts_versions set status = 'active' where id = ${pending.id}`;
+    if (pending.source_file_url) {
+      await tx`update user_settings set resume_mode = 'uploaded' where user_id = ${userId}`;
+    }
     const requeued = await requeueUnsent(tx, userId);
     const switchedToGenerated = await fallBackToGeneratedIfNoFile(tx, userId, pending.source_file_url);
     return { outcome: 'accepted', facts: pending.facts, requeued, switchedToGenerated };

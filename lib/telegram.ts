@@ -1,4 +1,5 @@
 import { sql, logEvent } from './db';
+import { put } from '@vercel/blob';
 import {
   getUserByChatId,
   registerUser,
@@ -987,12 +988,25 @@ export async function handleTelegramDocument(
       diff.experience_changes.length > 0 ? `Roles: ${diff.experience_changes.join('; ')}` : '',
     ].filter(Boolean).join('\n');
 
-    // Replaces any older pending version. The PDF itself is not stored yet (see docs/resume-onboarding.md).
+    let sourceFileUrl: string | null = null;
+    if (isPdf && sha256Hex) {
+      const hasValidBlobToken =
+        Boolean(process.env.BLOB_READ_WRITE_TOKEN) &&
+        !process.env.BLOB_READ_WRITE_TOKEN?.includes('vercel_blob_rw_token_here');
+      if (hasValidBlobToken) {
+        const blob = await put(`resumes/${user.id}/uploaded-${sha256Hex}.pdf`, buffer, { access: 'public' });
+        sourceFileUrl = blob.url;
+      } else {
+        sourceFileUrl = `data:application/pdf;base64,${buffer.toString('base64')}`;
+      }
+    }
+
+    // Replaces any older pending version and stores the uploaded PDF when available.
     await storePendingVersion(
       user.id,
       mergedFacts,
       diffSummaryText,
-      sha256Hex && pageCount ? { sha256: sha256Hex, pages: pageCount } : null
+      sha256Hex && pageCount ? { sha256: sha256Hex, pages: pageCount, url: sourceFileUrl } : null
     );
 
     // 8. Send summary to user
