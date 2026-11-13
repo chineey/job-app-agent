@@ -10,7 +10,7 @@ import {
   ApplicationRecord,
 } from '@/lib/claims';
 import { expandAuthorThread } from '@/lib/x';
-import { extractJobDetails, matchCandidate, tailorApplication, verifyApplication } from '@/lib/gemini';
+import { extractJobDetails, matchCandidate, tailorApplication, verifyApplication } from '@/lib/groq';
 import { evaluateSharedGates } from '@/lib/gates';
 import { fanoutJobToEligibleUsers } from '@/lib/fanout';
 import { MasterFacts } from '@/lib/schemas';

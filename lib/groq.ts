@@ -92,7 +92,7 @@ Return valid JSON adhering to this schema:
 }
 `;
 
-  return callGeminiWithRetry<JobExtract>(
+  return callLlmWithRetry<JobExtract>(
     prompt,
     imageParts,
     JobExtractSchema
@@ -135,7 +135,7 @@ Return JSON:
 }
 `;
 
-  return callGeminiWithRetry<JobMatch>(prompt, [], JobMatchSchema);
+  return callLlmWithRetry<JobMatch>(prompt, [], JobMatchSchema);
 }
 
 /**
@@ -179,7 +179,7 @@ Rules:
 Return JSON matching the schema.
 `;
 
-  return callGeminiWithRetry<TailorOutput>(prompt, [], TailorOutputSchema);
+  return callLlmWithRetry<TailorOutput>(prompt, [], TailorOutputSchema);
 }
 
 /**
@@ -219,44 +219,150 @@ Return JSON:
 }
 `;
 
-  return callGeminiWithRetry<VerifyOutput>(prompt, [], VerifyOutputSchema);
+  return callLlmWithRetry<VerifyOutput>(prompt, [], VerifyOutputSchema);
 }
 
 /**
- * Generic Gemini runner with multi-model fallback and retry on 503/429 spikes or Zod validation failure.
+ * Strips optional ```json ... ``` markdown fences around JSON responses.
  */
-async function callGeminiWithRetry<T>(
+function extractJsonText(raw: string): string {
+  const trimmed = raw.trim();
+  const fenceMatch = trimmed.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/i);
+  return fenceMatch ? fenceMatch[1].trim() : trimmed;
+}
+
+/**
+ * Calls the Groq Chat Completions endpoint (supports text + multimodal image_url).
+ */
+async function callGroqChat(prompt: string, parts: Part[], modelId: string): Promise<string> {
+  const groqKey = process.env.GROQ_API_KEY || '';
+  const baseUrl = (process.env.GROQ_BASE_URL || 'https://api.groq.com/openai/v1').replace(/\/+$/, '');
+
+  const userContent: Array<
+    | { type: 'text'; text: string }
+    | { type: 'image_url'; image_url: { url: string } }
+  > = [{ type: 'text', text: prompt }];
+
+  for (const part of parts) {
+    if ('inlineData' in part && part.inlineData) {
+      userContent.push({
+        type: 'image_url',
+        image_url: {
+          url: `data:${part.inlineData.mimeType};base64,${part.inlineData.data}`,
+        },
+      });
+    }
+  }
+
+  const buildBody = (useResponseFormat: boolean) => ({
+    model: modelId,
+    temperature: 0.1,
+    messages: [
+      {
+        role: 'system',
+        content: 'You are a strict JSON generator. Return only valid JSON with no markdown or extra commentary.',
+      },
+      {
+        role: 'user',
+        content: userContent.length === 1 ? prompt : userContent,
+      },
+    ],
+    ...(useResponseFormat ? { response_format: { type: 'json_object' } } : {}),
+  });
+
+  const doRequest = (useResponseFormat: boolean) =>
+    fetch(`${baseUrl}/chat/completions`, {
+      method: 'POST',
+      cache: 'no-store',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${groqKey}`,
+      },
+      body: JSON.stringify(buildBody(useResponseFormat)),
+      signal: AbortSignal.timeout(45000),
+    });
+
+  let res = await doRequest(true);
+  if (res.status === 400) {
+    // Retry without response_format if a specific model rejects it
+    res = await doRequest(false);
+  }
+
+  if (!res.ok) {
+    const errText = await res.text();
+    throw new Error(`Groq API error (${res.status}): ${errText}`);
+  }
+
+  const data = await res.json();
+  const content = data.choices?.[0]?.message?.content;
+  if (typeof content !== 'string' || !content.trim()) {
+    throw new Error('Groq API returned empty content');
+  }
+  return content;
+}
+
+/**
+ * Generic LLM runner: defaults to Groq (when GROQ_API_KEY is set and not in E2E Gemini mode)
+ * and falls back to Gemini if Groq is unset or fails.
+ */
+export async function callLlmWithRetry<T>(
   prompt: string,
   parts: Part[],
   schema: { parse: (val: unknown) => T; safeParse: (val: unknown) => { success: boolean; data?: T; error?: unknown } }
 ): Promise<T> {
-  const candidateModels = Array.from(new Set([
-    process.env.GEMINI_MODEL || 'gemini-3.5-flash',
-    'gemini-3.7-flash',
-    'gemini-3.1-flash-lite',
-  ]));
+  const groqAvailable = Boolean(process.env.GROQ_API_KEY) && !process.env.GEMINI_API_BASE_URL;
+  const geminiAvailable = Boolean(process.env.GEMINI_API_KEY) || Boolean(process.env.GEMINI_API_BASE_URL);
+
+  const groqModels = Array.from(
+    new Set([
+      process.env.GROQ_MODEL || 'qwen/qwen3.8-27b',
+      'openai/gpt-oss-120b',
+      'openai/gpt-oss-20b',
+    ])
+  );
+  const geminiModels = Array.from(
+    new Set([
+      process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+      'gemini-3.5-flash',
+      'gemini-3.1-flash-lite',
+    ])
+  );
+
+  const providers: Array<{ kind: 'groq' | 'gemini'; modelId: string }> = [
+    ...(groqAvailable ? groqModels.map((modelId) => ({ kind: 'groq' as const, modelId })) : []),
+    ...(geminiAvailable ? geminiModels.map((modelId) => ({ kind: 'gemini' as const, modelId })) : []),
+  ];
 
   let lastError: Error | null = null;
   let currentPrompt = prompt;
 
-  for (const modelId of candidateModels) {
-    const model = genAI.getGenerativeModel(
-      {
-        model: modelId,
-        generationConfig: {
-          responseMimeType: 'application/json',
-          temperature: 0.1,
-        },
-      },
-      geminiRequestOptions
-    );
+  for (const { kind, modelId } of providers) {
+    const geminiModel =
+      kind === 'gemini'
+        ? genAI.getGenerativeModel(
+            {
+              model: modelId,
+              generationConfig: {
+                responseMimeType: 'application/json',
+                temperature: 0.1,
+              },
+            },
+            geminiRequestOptions
+          )
+        : null;
 
     for (let attempt = 0; attempt < 2; attempt++) {
       try {
-        const contents = [currentPrompt, ...parts];
-        const result = await model.generateContent(contents);
-        const text = result.response.text();
-        const parsedJson = JSON.parse(text);
+        let text: string;
+        if (kind === 'groq') {
+          text = await callGroqChat(currentPrompt, parts, modelId);
+        } else {
+          const contents = [currentPrompt, ...parts];
+          const result = await geminiModel!.generateContent(contents);
+          text = result.response.text();
+        }
+
+        const parsedJson = JSON.parse(extractJsonText(text));
         const validated = schema.safeParse(parsedJson);
 
         if (validated.success && validated.data) {
@@ -268,7 +374,8 @@ async function callGeminiWithRetry<T>(
         currentPrompt = `${prompt}\n\nPREVIOUS ATTEMPT FAILED VALIDATION WITH ERROR:\n${errorMsg}\nPlease fix and output strictly valid JSON.`;
       } catch (err: unknown) {
         lastError = err instanceof Error ? err : new Error(String(err));
-        console.warn(`[Gemini] Model ${modelId} attempt ${attempt + 1} failed: ${lastError.message}`);
+        const label = kind === 'groq' ? 'Groq' : 'Gemini';
+        console.warn(`[${label}] Model ${modelId} attempt ${attempt + 1} failed: ${lastError.message}`);
         if (lastError.message?.includes('503') || lastError.message?.includes('429')) {
           await new Promise((resolve) => setTimeout(resolve, 1500));
         } else {
@@ -278,7 +385,7 @@ async function callGeminiWithRetry<T>(
     }
   }
 
-  throw lastError || new Error('Gemini structured output failed after retry');
+  throw lastError || new Error('LLM structured output failed after retry');
 }
 
 import { ReplyClassification, ReplyClassificationSchema, ReplyDraft, ReplyDraftSchema } from './schemas';
@@ -310,7 +417,7 @@ Return JSON:
 }
 `;
 
-  return callGeminiWithRetry<ReplyClassification>(prompt, [], ReplyClassificationSchema);
+  return callLlmWithRetry<ReplyClassification>(prompt, [], ReplyClassificationSchema);
 }
 
 /**
@@ -348,6 +455,6 @@ Return JSON:
 }
 `;
 
-  return callGeminiWithRetry<ReplyDraft>(prompt, [], ReplyDraftSchema);
+  return callLlmWithRetry<ReplyDraft>(prompt, [], ReplyDraftSchema);
 }
 

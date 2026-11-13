@@ -1,7 +1,7 @@
 import type { gmail_v1 } from 'googleapis';
 import { sql, logEvent } from './db';
 import { createGmailDraft, getThreadInboundMessages, searchBounces } from './gmail';
-import { classifyRecruiterReply, generateReplyDraft } from './gemini';
+import { classifyRecruiterReply, generateReplyDraft } from './groq';
 import { pauseOnHighBounceRate } from './ramp';
 import { sendTelegramMessage } from './telegram';
 import type { MasterFacts } from './schemas';
