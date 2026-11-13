@@ -61,6 +61,8 @@ export async function GET(req: NextRequest) {
       // Check if thread expansion is needed (Section 7.1a)
       let threadText = job.thread_text || '';
       let combinedMedia = [...mediaUrls];
+      let resolvedApplyLink = job.apply_link || null;
+      let resolvedApplyLinkDomain = job.apply_link_domain || null;
 
       const rawHasThreadSignal =
         job.raw_text.includes('🧵') ||
@@ -72,18 +74,25 @@ export async function GET(req: NextRequest) {
         const thread = await expandAuthorThread(job.conversation_id, job.author_handle, 10);
         threadText = thread.threadText;
         combinedMedia = Array.from(new Set([...combinedMedia, ...thread.mediaUrls]));
+        if (!resolvedApplyLink && thread.applyLink) {
+          resolvedApplyLink = thread.applyLink;
+          resolvedApplyLinkDomain = thread.applyLinkDomain;
+        }
 
         await sql`
           update jobs
           set thread_fetched = true,
               thread_text = ${threadText},
-              media_urls = ${JSON.stringify(combinedMedia)}
+              media_urls = ${JSON.stringify(combinedMedia)},
+              apply_link = coalesce(${resolvedApplyLink}, apply_link),
+              apply_link_domain = coalesce(${resolvedApplyLinkDomain}, apply_link_domain)
           where id = ${job.id} and claim_token = ${token}
         `;
       }
 
       // Gemini Multimodal Extraction
-      const extract = await extractJobDetails(job.raw_text, combinedMedia);
+      const fullText = threadText ? `${job.raw_text}\n\n${threadText}` : job.raw_text;
+      const extract = await extractJobDetails(fullText, combinedMedia);
 
       // Evaluate Round 1 Shared Gates
       const gateResult = await evaluateSharedGates({
@@ -91,7 +100,7 @@ export async function GET(req: NextRequest) {
         rawText: job.raw_text,
         threadText,
         transcribedText: extract.transcribed_text,
-        applyLink: job.apply_link,
+        applyLink: resolvedApplyLink,
       });
 
       if (!gateResult.pass) {
@@ -111,6 +120,12 @@ export async function GET(req: NextRequest) {
       }
 
       // Job passed gates -> set status = 'extracted'
+      const resolvedApplyMethod = gateResult.route === 'email' ? 'email' : extract.apply_method;
+      const parsedDeadline =
+        extract.deadline && !isNaN(new Date(extract.deadline).getTime())
+          ? new Date(extract.deadline)
+          : null;
+
       await sql`
         update jobs
         set status = 'extracted',
@@ -125,9 +140,9 @@ export async function GET(req: NextRequest) {
             visa_sponsorship = ${extract.visa_sponsorship},
             min_years = ${extract.min_years},
             salary = ${extract.salary},
-            deadline = ${extract.deadline ? new Date(extract.deadline) : null},
+            deadline = ${parsedDeadline},
             requirements = ${JSON.stringify(extract.requirements)},
-            apply_method = ${extract.apply_method},
+            apply_method = ${resolvedApplyMethod},
             contact_email = ${gateResult.contactEmail},
             address_source = ${gateResult.addressSource},
             address_mx_ok = true,
@@ -145,7 +160,9 @@ export async function GET(req: NextRequest) {
       const fanoutRes = await fanoutJobToEligibleUsers({
         ...job,
         contact_email: gateResult.contactEmail,
-        apply_method: extract.apply_method,
+        apply_method: resolvedApplyMethod,
+        apply_link: resolvedApplyLink,
+        apply_link_domain: resolvedApplyLinkDomain,
       } as JobRecord);
 
       if (fanoutRes.fannedOutCount > 0) {
@@ -248,7 +265,14 @@ export async function GET(req: NextRequest) {
         select resume_mode from user_settings where user_id = ${app.user_id} limit 1
       `) as { resume_mode: 'generated' | 'uploaded' }[];
 
-      if (factsRow.length === 0 || jobRow.length === 0) continue;
+      if (factsRow.length === 0 || jobRow.length === 0) {
+        await sql`
+          update applications
+          set status = 'failed', status_reason = 'missing_facts_or_job', claim_token = null, locked_at = null
+          where id = ${app.id} and claim_token = ${token}
+        `;
+        continue;
+      }
 
       const facts = factsRow[0].facts;
       const job = jobRow[0];
@@ -274,12 +298,16 @@ export async function GET(req: NextRequest) {
         const pdfBuffer = await generateResumePdfBuffer(facts, tailored.resume_json);
         const blobPath = `resumes/${app.user_id}/${app.id}/${token}.pdf`;
 
-        if (process.env.BLOB_READ_WRITE_TOKEN) {
+        const hasValidBlobToken =
+          Boolean(process.env.BLOB_READ_WRITE_TOKEN) &&
+          !process.env.BLOB_READ_WRITE_TOKEN?.includes('vercel_blob_rw_token_here');
+
+        if (hasValidBlobToken) {
           const blob = await put(blobPath, pdfBuffer, { access: 'public' });
           resumeBlobUrl = blob.url;
         } else {
-          // Fallback / mock storage path for local development
-          resumeBlobUrl = `https://blob.local/${blobPath}`;
+          // Reliable local/dev base64 data URL fallback
+          resumeBlobUrl = `data:application/pdf;base64,${pdfBuffer.toString('base64')}`;
         }
       } else if (resumeMode === 'uploaded') {
         // Attach user's uploaded original file directly
@@ -317,7 +345,14 @@ export async function GET(req: NextRequest) {
         select facts from facts_versions where id = ${app.facts_version_id} limit 1
       `) as { facts: MasterFacts }[];
 
-      if (factsRow.length === 0) continue;
+      if (factsRow.length === 0) {
+        await sql`
+          update applications
+          set status = 'failed', status_reason = 'missing_facts', claim_token = null, locked_at = null
+          where id = ${app.id} and claim_token = ${token}
+        `;
+        continue;
+      }
       const facts = factsRow[0].facts;
 
       await renewApplicationLease(app.id, token);

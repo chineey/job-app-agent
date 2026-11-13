@@ -134,12 +134,18 @@ function linkCard(app: LinkApplication): string {
 async function sendResume(app: LinkApplication): Promise<void> {
   if (!app.resume_blob_url) return;
   try {
-    const res = await fetch(app.resume_blob_url, { cache: 'no-store' });
-    if (!res.ok) throw new Error(`Resume download returned HTTP ${res.status}.`);
+    let buffer: Buffer;
+    if (app.resume_blob_url.startsWith('data:application/pdf;base64,')) {
+      buffer = Buffer.from(app.resume_blob_url.slice('data:application/pdf;base64,'.length), 'base64');
+    } else {
+      const res = await fetch(app.resume_blob_url, { cache: 'no-store' });
+      if (!res.ok) throw new Error(`Resume download returned HTTP ${res.status}.`);
+      buffer = Buffer.from(await res.arrayBuffer());
+    }
     const company = (app.company ?? 'Application').replace(/[^A-Za-z0-9]+/g, '_');
     await sendTelegramDocument(
       app.telegram_chat_id,
-      Buffer.from(await res.arrayBuffer()),
+      buffer,
       `${company}_Resume.pdf`,
       `Resume for ${app.role ?? 'this role'}`
     );

@@ -17,7 +17,8 @@ import {
 import { resolveSendAttempt, runSendPass } from './send';
 import { IMPORT_LIMIT, importPastRecipients, openDrafts, recentSends, skipApplication } from './applications';
 import { capCeiling, sendCap, stageCap } from './ramp';
-import { markLinkApplied, waitingLinkApplications } from './links';
+import { dispatchLinkApplications, markLinkApplied, waitingLinkApplications } from './links';
+import { fetchSinglePost, expandAuthorThread } from './x';
 import {
   acceptPendingVersion,
   activeYearsConfirmed,
@@ -709,13 +710,170 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
     }
 
     default: {
-      const tweetMatch = text.match(/(?:twitter|x)\.com\/\w+\/status\/(\d+)/i);
+      const tweetMatch = text.match(/(?:https?:\/\/)?(?:www\.|mobile\.|fx|vx)?(?:twitter|x)\.com\/(?:\w+|i\/web)\/status\/(\d+)/i);
       if (tweetMatch) {
-        await sendTelegramMessage(chatId, `🔍 *Detected Job Post URL!* Processing via pipeline...`);
+        const postId = tweetMatch[1];
+        const postUrl = tweetMatch[0].startsWith('http') ? tweetMatch[0] : `https://${tweetMatch[0]}`;
+        await sendTelegramMessage(chatId, `🔍 *Detected Job Post URL!* Fetching post from X...`);
+
         try {
+          // 1. Fetch post and expand author thread
+          const postData = await fetchSinglePost(postId);
+          if (!postData) {
+            await sendTelegramMessage(chatId, `❌ Could not retrieve post from X. Please verify the URL or try again later.`);
+            break;
+          }
+
+          let threadText = '';
+          let combinedMedia = [...postData.mediaUrls];
+          let threadPostIds: string[] = [];
+          let applyLink = postData.applyLink;
+          let applyLinkDomain = postData.applyLinkDomain;
+
+          if (postData.tweet.conversation_id && postData.authorUsername) {
+            const thread = await expandAuthorThread(postData.tweet.conversation_id, postData.authorUsername, 10);
+            threadText = thread.threadText;
+            combinedMedia = Array.from(new Set([...combinedMedia, ...thread.mediaUrls]));
+            threadPostIds = thread.threadPostIds;
+            if (!applyLink && thread.applyLink) {
+              applyLink = thread.applyLink;
+              applyLinkDomain = thread.applyLinkDomain;
+            }
+          }
+
+          // 2. Insert/upsert into jobs table
+          await sql`
+            insert into jobs (
+              post_id,
+              post_url,
+              raw_text,
+              media_urls,
+              conversation_id,
+              author_id,
+              author_handle,
+              thread_text,
+              thread_post_ids,
+              thread_fetched,
+              apply_link,
+              apply_link_domain,
+              source,
+              submitted_by,
+              status
+            ) values (
+              ${postData.tweet.id},
+              ${postUrl},
+              ${postData.tweet.text},
+              ${JSON.stringify(combinedMedia)},
+              ${postData.tweet.conversation_id || null},
+              ${postData.tweet.author_id || null},
+              ${postData.authorUsername || null},
+              ${threadText || null},
+              ${JSON.stringify(threadPostIds)},
+              true,
+              ${applyLink},
+              ${applyLinkDomain},
+              'manual',
+              ${user.id},
+              'found'
+            )
+            on conflict (post_id) do update set
+              post_url = excluded.post_url,
+              raw_text = excluded.raw_text,
+              media_urls = excluded.media_urls,
+              thread_text = excluded.thread_text,
+              thread_post_ids = excluded.thread_post_ids,
+              thread_fetched = true,
+              apply_link = coalesce(excluded.apply_link, jobs.apply_link),
+              apply_link_domain = coalesce(excluded.apply_link_domain, jobs.apply_link_domain),
+              source = 'manual',
+              submitted_by = excluded.submitted_by,
+              status = 'found',
+              status_reason = null,
+              locked_at = null,
+              claim_token = null;
+          `;
+
+          // Delete any previous non-completed application for this user so fanout re-creates it cleanly
+          await sql`
+            delete from applications
+            where job_id = (select id from jobs where post_id = ${postData.tweet.id})
+              and user_id = ${user.id}
+              and status not in ('sent', 'applied_manually');
+          `;
+
+          await sendTelegramMessage(chatId, `⏳ Post ingested! Running Gemini extraction and matching...`);
+
+          // 3. Run processing and delivery passes
           await runOwnCron('process');
+          await dispatchLinkApplications();
           await runSendPass();
-          await sendTelegramMessage(chatId, `✅ Finished processing post!`);
+
+          // 4. Query status for this job
+          const jobRows = (await sql`
+            select id, status, status_reason, company, role, apply_method, contact_email, apply_link
+            from jobs where post_id = ${postData.tweet.id} limit 1;
+          `) as Array<{
+            id: string;
+            status: string;
+            status_reason: string | null;
+            company: string | null;
+            role: string | null;
+            apply_method: string | null;
+            contact_email: string | null;
+            apply_link: string | null;
+          }>;
+
+          if (jobRows.length > 0) {
+            const j = jobRows[0];
+            const appRows = (await sql`
+              select id, status, fit_score, status_reason, route
+              from applications where job_id = ${j.id} and user_id = ${user.id} limit 1;
+            `) as Array<{
+              id: string;
+              status: string;
+              fit_score: number | null;
+              status_reason: string | null;
+              route: string | null;
+            }>;
+
+            if (appRows.length > 0) {
+              const a = appRows[0];
+              const userSettings = await getUserSettings(user.id);
+              const statusNote =
+                a.status === 'sent'
+                  ? userSettings?.dry_run
+                    ? `\n🧪 *Dry-run preview generated and sent above!*`
+                    : `\n📬 *An email application was sent directly from your Gmail!*`
+                  : a.status === 'link_ready'
+                    ? `\n🔗 *Manual-apply card and tailored resume sent above!*`
+                    : a.status === 'ready' || a.status === 'verified'
+                      ? `\n⏳ *Application is ready in the send queue.*`
+                      : '';
+
+              await sendTelegramMessage(
+                chatId,
+                `🎯 *Post Evaluated!*\n\n` +
+                  `• *Role:* ${j.role || 'Software Role'}\n` +
+                  `• *Company:* ${j.company || 'Unknown'}\n` +
+                  `• *Fit Score:* ${a.fit_score ?? 'N/A'}/100\n` +
+                  `• *Application Status:* \`${a.status}\`\n` +
+                  (a.status_reason ? `• *Note:* ${a.status_reason}\n` : '') +
+                  statusNote
+              );
+            } else if (j.status === 'rejected' || j.status === 'needs_manual') {
+              await sendTelegramMessage(
+                chatId,
+                `⚠️ *Post Not Automated (${j.status}):*\n\n` +
+                  (j.role ? `• *Role:* ${j.role}\n` : '') +
+                  (j.company ? `• *Company:* ${j.company}\n` : '') +
+                  `• *Reason:* \`${j.status_reason || j.status}\``
+              );
+            } else {
+              await sendTelegramMessage(chatId, `✅ Finished processing post!`);
+            }
+          } else {
+            await sendTelegramMessage(chatId, `✅ Finished processing post!`);
+          }
         } catch (err: unknown) {
           console.error('Manual post processing failed:', err);
           await sendTelegramMessage(chatId, '❌ Error processing post. Details are in the server log.');

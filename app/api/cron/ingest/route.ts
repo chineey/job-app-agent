@@ -27,11 +27,18 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    // 1. Get highest post_id seen so far to pass as sinceId
-    const highestRow = (await sql`
-      select post_id from jobs order by created_at desc limit 1
-    `) as { post_id: string }[];
-    const sinceId = highestRow.length > 0 ? highestRow[0].post_id : undefined;
+    // 1. Get highest post_id seen so far (persisted in global_settings so pre-filtered batches advance the cursor)
+    const cursorRow = (await sql`
+      select value from global_settings where key = 'x_last_since_id' limit 1
+    `) as { value: string }[];
+    let sinceId = cursorRow.length > 0 ? cursorRow[0].value : undefined;
+
+    if (!sinceId) {
+      const highestRow = (await sql`
+        select post_id from jobs order by created_at desc limit 1
+      `) as { post_id: string }[];
+      sinceId = highestRow.length > 0 ? highestRow[0].post_id : undefined;
+    }
 
     // 2. Query X API v2
     const searchResult = await searchRecentJobPosts(sinceId, 10);
@@ -46,6 +53,8 @@ export async function GET(req: NextRequest) {
       }
 
       const postUrl = `https://x.com/i/web/status/${tweet.id}`;
+      const authorHandle = searchResult.authorUsernames?.[tweet.id] || null;
+      const linkInfo = searchResult.applyLinks?.[tweet.id] || { applyLink: null, applyLinkDomain: null };
 
       // Insert into jobs with conflict prevention
       const res = await sql`
@@ -56,6 +65,9 @@ export async function GET(req: NextRequest) {
           media_urls,
           conversation_id,
           author_id,
+          author_handle,
+          apply_link,
+          apply_link_domain,
           status
         )
         values (
@@ -65,6 +77,9 @@ export async function GET(req: NextRequest) {
           ${JSON.stringify(mediaUrls)},
           ${tweet.conversation_id || null},
           ${tweet.author_id || null},
+          ${authorHandle},
+          ${linkInfo.applyLink},
+          ${linkInfo.applyLinkDomain},
           'found'
         )
         on conflict (post_id) do nothing
@@ -74,6 +89,14 @@ export async function GET(req: NextRequest) {
       if (res.length > 0) {
         insertedCount++;
       }
+    }
+
+    if (searchResult.highestId) {
+      await sql`
+        insert into global_settings (key, value)
+        values ('x_last_since_id', ${searchResult.highestId})
+        on conflict (key) do update set value = excluded.value;
+      `;
     }
 
     return NextResponse.json({

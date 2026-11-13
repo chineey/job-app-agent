@@ -354,11 +354,15 @@ export async function executeSend(userId: string, attemptId: string): Promise<Se
     if (!attempt.resume_blob_url) {
       throw new Error('Application has no resume URL.');
     }
-    const res = await fetch(attempt.resume_blob_url, { cache: 'no-store' });
-    if (!res.ok) {
-      throw new Error(`Resume download returned HTTP ${res.status}.`);
+    if (attempt.resume_blob_url.startsWith('data:application/pdf;base64,')) {
+      resume = Buffer.from(attempt.resume_blob_url.slice('data:application/pdf;base64,'.length), 'base64');
+    } else {
+      const res = await fetch(attempt.resume_blob_url, { cache: 'no-store' });
+      if (!res.ok) {
+        throw new Error(`Resume download returned HTTP ${res.status}.`);
+      }
+      resume = Buffer.from(await res.arrayBuffer());
     }
-    resume = Buffer.from(await res.arrayBuffer());
   } catch (err) {
     // Never send an application without its resume.
     await recordConfirmedFailure(attempt, `Resume unavailable: ${errorMessage(err)}`, 'reserved');
