@@ -74,6 +74,7 @@ export async function resetDatabase(db: Database): Promise<void> {
     truncate users, invites, oauth_states, user_settings, facts_versions, jobs, applications,
              send_state, send_attempts, spend, user_spend, events, telegram_updates restart identity cascade;
     update global_settings set value = 'false' where key = 'global_paused';
+    delete from global_settings where key = 'x_last_since_id';
   `);
 }
 
