@@ -257,3 +257,38 @@ create table if not exists events (
   type text,
   detail jsonb
 );
+
+-- Telegram update ids already handled, so a redelivered update never runs a command twice.
+create table if not exists telegram_updates (
+  update_id bigint primary key,
+  received_at timestamptz not null default now()
+);
+
+-- One Gmail address per user: sending is serialized and capped per user, so a shared address
+-- would get each user's full allowance.
+create unique index if not exists users_gmail_address_unique
+  on users (lower(gmail_address)) where gmail_address is not null;
+
+-- Set when a dry-run preview of the application is shown, so each one is previewed (and counted) once.
+alter table applications add column if not exists dry_run_previewed_at timestamptz;
+
+-- Inbox scan bookkeeping: threads are checked in rotation, and each inbound message is handled once.
+alter table applications add column if not exists thread_checked_at timestamptz;
+alter table applications add column if not exists last_inbound_message_id text;
+
+-- One deadline reminder per waiting link application.
+alter table applications add column if not exists link_reminded_at timestamptz;
+
+-- Per-chat rate limiting reads recent updates by chat.
+alter table telegram_updates add column if not exists chat_id bigint;
+create index if not exists idx_telegram_updates_chat_received on telegram_updates (chat_id, received_at);
+
+-- Years of experience confirmed by the user with /set years (the parser only estimates them).
+alter table facts_versions add column if not exists years_confirmed boolean not null default false;
+-- At most one pending and one active version per user. Older code could leave duplicates; keep the newest.
+update facts_versions f set status = 'rejected'
+  where status = 'pending' and exists (select 1 from facts_versions n where n.user_id = f.user_id and n.status = 'pending' and n.id > f.id);
+update facts_versions f set status = 'superseded'
+  where status = 'active' and exists (select 1 from facts_versions n where n.user_id = f.user_id and n.status = 'active' and n.id > f.id);
+create unique index if not exists facts_versions_one_pending on facts_versions (user_id) where status = 'pending';
+create unique index if not exists facts_versions_one_active on facts_versions (user_id) where status = 'active';

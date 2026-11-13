@@ -1,26 +1,15 @@
 import crypto from 'crypto';
 
 /**
- * Derives the 32-byte AES key from the TOKEN_ENCRYPTION_KEY environment variable.
+ * Reads the 32-byte AES key from TOKEN_ENCRYPTION_KEY (base64). There is deliberately no fallback:
+ * a default key would be public, and hashing a passphrase would accept weak keys.
  */
 function getEncryptionKey(): Buffer {
-  const keyStr = process.env.TOKEN_ENCRYPTION_KEY;
-  if (!keyStr) {
-    if (process.env.NODE_ENV === 'test' || process.env.NODE_ENV !== 'production') {
-      // 32-byte fallback for dev / testing
-      return Buffer.from('12345678901234567890123456789012', 'utf-8');
-    }
-    throw new Error('TOKEN_ENCRYPTION_KEY environment variable is required');
+  const key = Buffer.from(process.env.TOKEN_ENCRYPTION_KEY ?? '', 'base64');
+  if (key.length !== 32) {
+    throw new Error('TOKEN_ENCRYPTION_KEY must be 32 random bytes, base64-encoded (openssl rand -base64 32).');
   }
-
-  // Attempt base64 decode; if length is 32 bytes use it, otherwise hash to 32 bytes
-  const buf = Buffer.from(keyStr, 'base64');
-  if (buf.length === 32) {
-    return buf;
-  }
-
-  // Fallback: SHA-256 hash ensures exactly 32 bytes
-  return crypto.createHash('sha256').update(keyStr).digest();
+  return key;
 }
 
 /**
