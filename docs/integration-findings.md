@@ -19,13 +19,20 @@ On 2 November 2026 the whole pipeline was run end to end for the first time (`e2
 | `lib/parse-resume.ts` | `pdf-parse` misread uploaded PDFs depending on Node's buffer pool: 17 of 30 valid uploads were rejected. | Pass a plain `Uint8Array` (see `resume-onboarding.md`) |
 | `lib/x.ts`, `lib/gemini.ts`, `lib/parse-resume.ts` | Not testable: provider URLs hard-coded | Test-only base URL variables, unset in every real environment |
 
-## Broken, left for Dev A
+## Fixed by Dev A on 13 November (`ce58473`)
 
-These are `todo` scenarios in `e2e/pipeline.e2e.mts`. They run and report, but don't fail CI until fixed.
+All three bugs reported here are fixed, and their scenarios in `e2e/pipeline.e2e.mts` are ordinary tests again:
 
-1. **Every link or form job is dropped.** Ingest never requests or stores the post's URL entities, so `apply_link` is always null. The gate marks every link job `needs_manual` (`link_missing`), and no user ever gets a link card. The spec takes the apply link from the post's entities, never from the model.
-2. **Ingest re-reads posts it has already paid for.** It resumes from the newest *stored* job, but stores a batch oldest-last and skips posts that fail the pre-filter. So the cursor lands on old posts, and each run fetches them again. `searchRecentJobPosts` already returns `highestId`, which is never used.
-3. **Thread expansion never runs.** It requires `author_handle`, and ingest never stores it (the search requests usernames but drops them).
+1. Link and form jobs keep their apply link (from the post's URL entities), so users get link cards.
+2. Ingest keeps its cursor in `global_settings` (`x_last_since_id`) and no longer re-reads posts.
+3. Ingest stores `author_handle`, so thread expansion can run.
+
+The same commit added manual post ingest (pasting a post URL in Telegram) and stores the generated resume as a `data:` URL in the database when no Blob token is set.
+
+## Open after `ce58473`
+
+- **Pasting a post URL has no limit.** `user_settings.manual_daily_cap` (5 a day) is never checked, and `fetchSinglePost` records an X read without checking the daily X budget. Any user can spend the shared X and Gemini budget by pasting links.
+- **Pasting a URL of a post already in the system resets the shared job to `found`** for everyone, and deletes the user's own unfinished applications for it, including skipped ones. If one of them has a send attempt, the delete fails on the foreign key and the user gets a generic error.
 
 ## Found by reading, not yet tested
 
