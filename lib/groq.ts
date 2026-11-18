@@ -47,13 +47,10 @@ async function fetchImagePart(url: string): Promise<Part | null> {
  */
 export async function extractJobDetails(
   rawText: string,
-  imageUrls: string[] = []
+  _imageUrls: string[] = []
 ): Promise<JobExtract> {
+  // Post images are intentionally skipped to keep extraction text-only and compatible with all models.
   const imageParts: Part[] = [];
-  for (const url of imageUrls.slice(0, 4)) {
-    const part = await fetchImagePart(url);
-    if (part) imageParts.push(part);
-  }
 
   const prompt = `
 You are an expert ATS extractor analyzing an engineering job post from X (Twitter).
@@ -177,6 +174,42 @@ Rules:
 4. If route is "link", provide a short suggested cover_note that the candidate can paste into the application form.
 
 Return JSON matching the schema.
+`;
+
+  return callLlmWithRetry<TailorOutput>(prompt, [], TailorOutputSchema);
+}
+
+/**
+ * Regenerates an email/cover-note draft incorporating user edit instructions.
+ * Always keeps resume_json null (uploaded-PDF-only mode).
+ */
+export async function regenerateApplicationDraft(
+  job: Partial<JobExtract>,
+  facts: MasterFacts,
+  current: { subject: string; body: string; coverNote: string | null },
+  instructions: string,
+  route: 'email' | 'link' = 'email'
+): Promise<TailorOutput> {
+  const prompt = `
+You are revising an engineering job application email for ${job.role || 'Software Engineer'} at ${job.company || 'Company'}.
+Mode: uploaded (resume_json MUST be null)
+Route: ${route}
+
+Current Draft:
+Subject: ${current.subject}
+Body:
+${current.body}
+Cover Note: ${current.coverNote || 'N/A'}
+
+User Requested Changes:
+${instructions}
+
+Candidate Master Facts (do NOT invent any skills, years, or projects outside these facts):
+- Strong Skills: ${facts.skills.strong.join(', ')}
+- Projects Bank: ${JSON.stringify(facts.projects)}
+- Experience Bank: ${JSON.stringify(facts.experience)}
+
+Return JSON matching the schema with "resume_json": null and updated "email_slots" (and "cover_note" if route is "link").
 `;
 
   return callLlmWithRetry<TailorOutput>(prompt, [], TailorOutputSchema);
@@ -315,14 +348,14 @@ export async function callLlmWithRetry<T>(
 
   const groqModels = Array.from(
     new Set([
-      process.env.GROQ_MODEL || 'qwen/qwen3.8-27b',
-      'openai/gpt-oss-120b',
+      process.env.GROQ_MODEL || 'openai/gpt-oss-120b',
       'openai/gpt-oss-20b',
+      'qwen/qwen3.8-27b',
     ])
   );
   const geminiModels = Array.from(
     new Set([
-      process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+      process.env.GEMINI_MODEL || 'gemini-3.8-flash',
       'gemini-3.5-flash',
       'gemini-3.1-flash-lite',
     ])
@@ -376,7 +409,9 @@ export async function callLlmWithRetry<T>(
         lastError = err instanceof Error ? err : new Error(String(err));
         const label = kind === 'groq' ? 'Groq' : 'Gemini';
         console.warn(`[${label}] Model ${modelId} attempt ${attempt + 1} failed: ${lastError.message}`);
-        if (lastError.message?.includes('503') || lastError.message?.includes('429')) {
+        if (lastError.message?.includes('429') || lastError.message?.includes('404')) {
+          break; // Immediately fall back to the next model when rate-limited or model not found
+        } else if (lastError.message?.includes('503')) {
           await new Promise((resolve) => setTimeout(resolve, 1500));
         } else {
           currentPrompt = `${prompt}\n\nPREVIOUS ATTEMPT FAILED WITH ERROR: ${lastError.message}\nPlease fix and output strictly valid JSON.`;

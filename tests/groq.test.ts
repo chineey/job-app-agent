@@ -84,22 +84,15 @@ describe('Groq LLM Integration with Gemini Fallback (lib/groq.ts)', () => {
     expect(secondBody.response_format).toBeUndefined();
   });
 
-  it('forwards image attachments as Groq image_url parts in extractJobDetails', async () => {
-    const fetchSpy = vi.fn(async (url: string | URL | Request, _init?: RequestInit) => {
-      const u = String(url);
-      if (u === 'https://example.com/flyer.png') {
-        return new Response(Uint8Array.from([137, 80, 78, 71]), {
-          status: 200,
-          headers: { 'content-type': 'image/png' },
-        });
-      }
+  it('skips post image URLs and sends text-only string content in extractJobDetails', async () => {
+    const fetchSpy = vi.fn(async (_url: string | URL | Request, _init?: RequestInit) => {
       return new Response(
         JSON.stringify({
           choices: [
             {
               message: {
                 content: JSON.stringify({
-                  transcribed_text: 'Apply to jobs@acme.com',
+                  transcribed_text: '',
                   is_job: true,
                   is_software_role: true,
                   role: 'Backend Engineer',
@@ -129,16 +122,37 @@ describe('Groq LLM Integration with Gemini Fallback (lib/groq.ts)', () => {
     expect(extract.is_job).toBe(true);
     expect(extract.company).toBe('Acme');
 
-    const chatCall = fetchSpy.mock.calls.find((c) => String(c[0]).endsWith('/chat/completions'));
-    expect(chatCall).toBeDefined();
-    const body = JSON.parse(chatCall![1]?.body as string);
-    const userContent = body.messages[1].content;
-    expect(Array.isArray(userContent)).toBe(true);
-    expect(
-      userContent.some(
-        (p: { type: string; image_url?: { url: string } }) =>
-          p.type === 'image_url' && p.image_url?.url.startsWith('data:image/png;base64,')
-      )
-    ).toBe(true);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(String(fetchSpy.mock.calls[0][0])).toBe('https://api.groq.com/openai/v1/chat/completions');
+    const body = JSON.parse(fetchSpy.mock.calls[0][1]?.body as string);
+    expect(typeof body.messages[1].content).toBe('string');
+  });
+
+  it('falls back to Gemini when all Groq models fail', async () => {
+    process.env.GEMINI_API_KEY = 'gemini-test-key';
+    const schema = z.object({ ok: z.boolean(), source: z.string() });
+    const fetchSpy = vi.fn(async (url: string | URL | Request) => {
+      const u = String(url);
+      if (u.startsWith('https://api.groq.com/')) {
+        return new Response('Groq rate limit exceeded', { status: 429 });
+      }
+      return new Response(
+        JSON.stringify({
+          candidates: [
+            {
+              content: {
+                parts: [{ text: '{"ok": true, "source": "gemini"}' }],
+              },
+            },
+          ],
+        }),
+        { status: 200 }
+      );
+    });
+    global.fetch = fetchSpy as unknown as typeof fetch;
+
+    const result = await callLlmWithRetry('Return ok', [], schema);
+    expect(result).toEqual({ ok: true, source: 'gemini' });
+    expect(fetchSpy.mock.calls.some((c) => String(c[0]).includes('generativelanguage.googleapis.com'))).toBe(true);
   });
 });

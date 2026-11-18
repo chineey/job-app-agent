@@ -14,8 +14,7 @@ import { extractJobDetails, matchCandidate, tailorApplication, verifyApplication
 import { evaluateSharedGates } from '@/lib/gates';
 import { fanoutJobToEligibleUsers } from '@/lib/fanout';
 import { MasterFacts } from '@/lib/schemas';
-import { generateResumePdfBuffer } from '@/lib/pdf/Resume';
-import { put } from '@vercel/blob';
+import { sendTelegramMessage } from '@/lib/telegram';
 
 export const dynamic = 'force-dynamic';
 // X searches and Gemini calls must be fresh: Next 14 otherwise caches them inside GET routes, so a
@@ -94,9 +93,14 @@ export async function GET(req: NextRequest) {
       const fullText = threadText ? `${job.raw_text}\n\n${threadText}` : job.raw_text;
       const extract = await extractJobDetails(fullText, combinedMedia);
 
-      // Evaluate Round 1 Shared Gates
+      // Evaluate Round 1 Shared Gates (allow user-approved flagged posts past scam/role checks)
+      const gateExtract =
+        job.status_reason === 'user_proceeded'
+          ? { ...extract, scam_risk: 'low' as const, is_job: true, is_software_role: true }
+          : extract;
+
       const gateResult = await evaluateSharedGates({
-        extract,
+        extract: gateExtract,
         rawText: job.raw_text,
         threadText,
         transcribedText: extract.transcribed_text,
@@ -129,6 +133,7 @@ export async function GET(req: NextRequest) {
       await sql`
         update jobs
         set status = 'extracted',
+            status_reason = null,
             transcribed_text = ${extract.transcribed_text},
             is_job = ${extract.is_job},
             is_software_role = ${extract.is_software_role},
@@ -261,10 +266,6 @@ export async function GET(req: NextRequest) {
         select * from jobs where id = ${app.job_id} limit 1
       `) as JobRecord[];
 
-      const settingsRow = (await sql`
-        select resume_mode from user_settings where user_id = ${app.user_id} limit 1
-      `) as { resume_mode: 'generated' | 'uploaded' }[];
-
       if (factsRow.length === 0 || jobRow.length === 0) {
         await sql`
           update applications
@@ -276,7 +277,7 @@ export async function GET(req: NextRequest) {
 
       const facts = factsRow[0].facts;
       const job = jobRow[0];
-      const resumeMode = settingsRow.length > 0 ? settingsRow[0].resume_mode : 'generated';
+      const resumeMode = 'uploaded' as const;
       const route = (app.route as 'email' | 'link') || 'email';
 
       await renewApplicationLease(app.id, token);
@@ -291,28 +292,8 @@ export async function GET(req: NextRequest) {
         route
       );
 
-      let resumeBlobUrl: string | null = null;
-
-      if (resumeMode === 'generated' && tailored.resume_json) {
-        // Render ATS PDF Buffer
-        const pdfBuffer = await generateResumePdfBuffer(facts, tailored.resume_json);
-        const blobPath = `resumes/${app.user_id}/${app.id}/${token}.pdf`;
-
-        const hasValidBlobToken =
-          Boolean(process.env.BLOB_READ_WRITE_TOKEN) &&
-          !process.env.BLOB_READ_WRITE_TOKEN?.includes('vercel_blob_rw_token_here');
-
-        if (hasValidBlobToken) {
-          const blob = await put(blobPath, pdfBuffer, { access: 'public' });
-          resumeBlobUrl = blob.url;
-        } else {
-          // Reliable local/dev base64 data URL fallback
-          resumeBlobUrl = `data:application/pdf;base64,${pdfBuffer.toString('base64')}`;
-        }
-      } else if (resumeMode === 'uploaded') {
-        // Attach user's uploaded original file directly
-        resumeBlobUrl = factsRow[0].source_file_url;
-      }
+      // Attach user's uploaded PDF directly without regenerating a resume
+      const resumeBlobUrl: string | null = factsRow[0].source_file_url;
 
       await sql`
         update applications
@@ -379,6 +360,28 @@ export async function GET(req: NextRequest) {
               updated_at = now()
           where id = ${app.id} and claim_token = ${token}
         `;
+
+        const infoRows = (await sql`
+          select u.telegram_chat_id, j.role, j.company, j.source
+          from users u
+          join jobs j on j.id = ${app.job_id}
+          where u.id = ${app.user_id}
+          limit 1
+        `) as Array<{ telegram_chat_id: string | number; role: string | null; company: string | null; source: string | null }>;
+
+        if (infoRows.length > 0 && infoRows[0].source !== 'manual') {
+          const info = infoRows[0];
+          const claims = audit.unsupported_claims.length > 0 ? `\n• *Flagged:* ${audit.unsupported_claims.join('; ')}` : '';
+          await sendTelegramMessage(
+            Number(info.telegram_chat_id),
+            `⚠️ *Application Flagged for Review*\n\n` +
+              `• *Role:* ${info.role || 'Software Role'}\n` +
+              `• *Company:* ${info.company || 'Unknown'}\n` +
+              `• *Reason:* \`unsupported_claims\`` +
+              claims +
+              `\n\nReply \`/proceed ${app.id}\` to send anyway, or \`/skip ${app.id}\` to discard.`
+          );
+        }
       } else {
         const nextStatus = app.route === 'link' ? 'link_ready' : 'ready';
         await sql`

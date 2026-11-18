@@ -46,15 +46,31 @@ export function extractContactEmails(
  * Catches transcription OCR errors (e.g. l vs 1, 0 vs O).
  */
 export async function checkMxRecords(domain: string): Promise<boolean> {
-  if (!domain || domain.trim() === '') return false;
+  const trimmed = domain?.trim();
+  if (!trimmed) return false;
   try {
     const records = await Promise.race([
-      dns.resolveMx(domain.trim()),
+      dns.resolveMx(trimmed),
       new Promise<never>((_, reject) => setTimeout(() => reject(new Error('DNS timeout')), 3000)),
     ]);
-    return records && records.length > 0;
-  } catch (error) {
-    return false;
+    return Boolean(records && records.length > 0);
+  } catch (error: unknown) {
+    const code = (error as { code?: string })?.code;
+    if (code === 'ENOTFOUND' || code === 'ENODATA') {
+      return false;
+    }
+    // Windows/local c-ares resolvers often throw ECONNREFUSED on queryMx; fall back to DoH.
+    try {
+      const res = await fetch(`https://dns.google/resolve?name=${encodeURIComponent(trimmed)}&type=MX`, {
+        cache: 'no-store',
+        signal: AbortSignal.timeout(3000),
+      });
+      if (!res.ok) return false;
+      const data = (await res.json()) as { Status?: number; Answer?: unknown[] };
+      return data.Status === 0 && Array.isArray(data.Answer) && data.Answer.length > 0;
+    } catch {
+      return false;
+    }
   }
 }
 

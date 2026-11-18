@@ -141,8 +141,8 @@ export async function registerUser(
     if (!isAdmin) {
       await tx`update invites set uses = uses + 1 where code = ${code}`;
     }
-    // Schema defaults are the onboarding defaults, including dry_run = true.
-    await tx`insert into user_settings (user_id) values (${user.id})`;
+    // No dry-run gate: new users start at Stage 1 with live sending enabled on explicit /send.
+    await tx`insert into user_settings (user_id, dry_run, ramp_stage) values (${user.id}, false, 1)`;
     await tx`insert into send_state (user_id) values (${user.id})`;
     return { outcome: 'created', user };
   });
