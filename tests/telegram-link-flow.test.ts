@@ -218,7 +218,7 @@ describe('Telegram Link Ingestion & Pipeline Flow', () => {
       expect(mockFetchSinglePost).toHaveBeenCalledWith('1900000001');
       expect(mockExpandAuthorThread).toHaveBeenCalledWith('1900000001', 'acme_cto', 10);
       expect(mockDispatchLinkApplications).toHaveBeenCalledTimes(1);
-      expect(mockRunSendPass).toHaveBeenCalledTimes(1);
+      expect(mockRunSendPass).not.toHaveBeenCalled();
 
       const calledUrls = fetchSpy.mock.calls.map((c) => String(c[0]));
       expect(calledUrls.some((u) => u.includes('/api/cron/process'))).toBe(true);

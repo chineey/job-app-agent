@@ -1,5 +1,6 @@
 import { sql, logEvent } from './db';
 import { sendTelegramDocument, sendTelegramMessage } from './telegram';
+import { decodePdfDataUrl, extractResumeFilename } from './send';
 
 // Link and form applications: the agent never opens or fills the form. It sends the user a card
 // with the apply link, cover note and resume, once, and a reminder before the deadline.
@@ -135,8 +136,9 @@ async function sendResume(app: LinkApplication): Promise<void> {
   if (!app.resume_blob_url) return;
   try {
     let buffer: Buffer;
-    if (app.resume_blob_url.startsWith('data:application/pdf;base64,')) {
-      buffer = Buffer.from(app.resume_blob_url.slice('data:application/pdf;base64,'.length), 'base64');
+    const inlinePdf = decodePdfDataUrl(app.resume_blob_url);
+    if (inlinePdf) {
+      buffer = inlinePdf;
     } else {
       const res = await fetch(app.resume_blob_url, { cache: 'no-store' });
       if (!res.ok) throw new Error(`Resume download returned HTTP ${res.status}.`);
@@ -146,7 +148,7 @@ async function sendResume(app: LinkApplication): Promise<void> {
     await sendTelegramDocument(
       app.telegram_chat_id,
       buffer,
-      `${company}_Resume.pdf`,
+      extractResumeFilename(app.resume_blob_url, `${company}_Resume.pdf`),
       `Resume for ${app.role ?? 'this role'}`
     );
   } catch (err) {

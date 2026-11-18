@@ -3,7 +3,6 @@ import { put } from '@vercel/blob';
 import {
   getUserByChatId,
   registerUser,
-  canonicalTimeZone,
   agreeToTerms,
   getUserSettings,
   updateUserSettings,
@@ -15,20 +14,19 @@ import {
   MAX_READS_CEILING,
   deleteUserAccount,
 } from './users';
-import { resolveSendAttempt, runSendPass } from './send';
-import { IMPORT_LIMIT, importPastRecipients, openDrafts, recentSends, skipApplication } from './applications';
+import { decodePdfDataUrl, extractResumeFilename, resolveSendAttempt, runSendPass } from './send';
+import { IMPORT_LIMIT, importPastRecipients, openDrafts, proceedApplication, proceedJob, recentSends, skipApplication } from './applications';
 import { capCeiling, sendCap, stageCap } from './ramp';
 import { dispatchLinkApplications, markLinkApplied, waitingLinkApplications } from './links';
 import { fetchSinglePost, expandAuthorThread } from './x';
 import {
   acceptPendingVersion,
-  activeYearsConfirmed,
   rejectPendingVersion,
   rollbackVersion,
   setFact,
-  setResumeMode,
   storePendingVersion,
 } from './facts-versions';
+import { regenerateApplicationDraft } from './groq';
 import { disconnectGmail, type DisconnectResult } from './gmail';
 import { validateUploadedPdf, extractResumeText, parseResumeTextToFacts } from './parse-resume';
 import { mergeWithActiveFacts, computeFactsDiff } from './facts';
@@ -299,10 +297,8 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
         chatId,
         `📊 *Your Status Overview*\n\n` +
           `*Gmail:* \`${user.gmail_status}\` (${user.gmail_address || 'not connected'})\n` +
-          `*Ramp Stage:* \`${settings.ramp_stage}\` | *Dry Run:* \`${settings.dry_run ? 'ON' : 'OFF'}\`\n` +
-          `*Today's Sends:* ${todaySends[0].count} / ${settings.dry_run ? 0 : sendCap(settings)}\n` +
-          `*Send Window:* ${settings.send_window_start}:00 - ${settings.send_window_end}:00 (${settings.timezone})\n` +
-          `*Resume Mode:* \`${settings.resume_mode}\`\n\n` +
+          `*Ramp Stage:* \`${settings.ramp_stage}\`\n` +
+          `*Today's Sends:* ${todaySends[0].count} / ${sendCap(settings)}\n\n` +
           `*Queue Counts:*\n` +
           `• Verified / Ready: ${(statusMap['verified'] ?? 0) + (statusMap['ready'] ?? 0)}\n` +
           `• Total Sent: ${statusMap['sent'] || 0}\n` +
@@ -364,81 +360,6 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
       }
       await updateUserSettings(user.id, { current_cap: capVal });
       await sendTelegramMessage(chatId, `✅ Daily cap updated to ${capVal} sends/day.`);
-      break;
-    }
-
-    case '/dry': {
-      const sub = args[0]?.toLowerCase();
-      if (sub === 'on') {
-        await updateUserSettings(user.id, { dry_run: true });
-        await sendTelegramMessage(chatId, '🧪 Dry run enabled. Emails will be simulated.');
-      } else if (sub === 'off') {
-        // Checked with and without `confirm`: confirming must never skip the prerequisites.
-        const activeFacts = (await sql`
-          select * from facts_versions where user_id = ${user.id} and status = 'active' limit 1;
-        `) as Array<{ id: number; facts: { years_experience?: number } }>;
-
-        const hasGmail = user.gmail_status === 'connected';
-        const hasFacts = activeFacts.length > 0;
-        // Confirmed by the user with /set years; the parser's estimate does not count.
-        const hasYears = await activeYearsConfirmed(user.id);
-        const has5Drafts = settings.dry_run_drafts_shown >= 5;
-
-        if (!hasGmail || !hasFacts || !hasYears || !has5Drafts) {
-          await sendTelegramMessage(
-            chatId,
-            `⚠️ *Cannot Exit Dry Run Yet*\n\n` +
-              `Prerequisites remaining:\n` +
-              `• Connected Gmail: ${hasGmail ? '✅' : '❌ (/connect)'}\n` +
-              `• Accepted Master Facts: ${hasFacts ? '✅' : '❌ (/accept)'}\n` +
-              `• Set Experience: ${hasYears ? '✅' : '❌ (/set years N)'}\n` +
-              `• Reviewed >= 5 Drafts: ${has5Drafts ? '✅' : `❌ (${settings.dry_run_drafts_shown}/5 shown)`}`
-          );
-          return;
-        }
-
-        if (args[1]?.toLowerCase() !== 'confirm') {
-          await sendTelegramMessage(
-            chatId,
-            `⚠️ *Ready to go live at Stage 1 (3 sends/day)?*\nConfirm by typing:\n\`/dry off confirm\``
-          );
-          return;
-        }
-
-        await updateUserSettings(user.id, {
-          dry_run: false,
-          ramp_stage: 1,
-          current_cap: Math.min(stageCap(1), settings.max_cap),
-          ramp_stage_started_at: new Date().toISOString(),
-        });
-        await sendTelegramMessage(chatId, '🚀 *Live Mode Active!* You are at Stage 1 (3 sends/day).');
-      } else {
-        await sendTelegramMessage(chatId, 'Usage: `/dry on` or `/dry off`');
-      }
-      break;
-    }
-
-    case '/window': {
-      const h1 = parseInt(args[0], 10);
-      const h2 = parseInt(args[1], 10);
-      if (isNaN(h1) || isNaN(h2) || h1 < 0 || h1 > 23 || h2 < 0 || h2 > 24 || h1 >= h2) {
-        await sendTelegramMessage(chatId, 'Usage: `/window <startHour> <endHour>` (e.g. `/window 9 17`)');
-        return;
-      }
-      await updateUserSettings(user.id, { send_window_start: h1, send_window_end: h2 });
-      await sendTelegramMessage(chatId, `✅ Send window set to ${h1}:00 - ${h2}:00 (${settings.timezone}).`);
-      break;
-    }
-
-    case '/timezone': {
-      // An unknown zone would make every send query for this user throw, so only known zones are stored.
-      const tz = args[0] ? canonicalTimeZone(args[0]) : null;
-      if (!tz) {
-        await sendTelegramMessage(chatId, 'Usage: `/timezone <IANA-zone>` (e.g. `/timezone Africa/Lagos`, `America/New_York`)');
-        return;
-      }
-      await updateUserSettings(user.id, { timezone: tz });
-      await sendTelegramMessage(chatId, `✅ Timezone updated to \`${tz}\`.`);
       break;
     }
 
@@ -569,18 +490,11 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
         const isRelo = val.toLowerCase() === 'yes';
         change = (facts) => ({ ...facts, open_to_relocation: isRelo });
         confirmation = `✅ Open to relocation set to: ${isRelo ? 'Yes' : 'No'}.`;
-      } else if (field === 'framing' && val) {
-        change = (facts) => ({ ...facts, gap_framing: val });
-        confirmation = `✅ Gap framing sentence updated:\n"${val}"`;
-      } else if (field === 'gaps') {
-        const gapsList = val.split(',').map((g) => g.trim()).filter(Boolean);
-        change = (facts) => ({ ...facts, skills: { ...facts.skills, known_gaps: gapsList } });
-        confirmation = `✅ Known gaps updated: ${gapsList.join(', ') || '(none)'}`;
       }
       if (!change) {
         await sendTelegramMessage(
           chatId,
-          `Usage:\n• \`/set years <N>\`\n• \`/set relocation yes|no\`\n• \`/set framing <text>\`\n• \`/set gaps <a, b, c>\``
+          `Usage:\n• \`/set years <N>\`\n• \`/set relocation yes|no\``
         );
         return;
       }
@@ -592,40 +506,6 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
       }
       // Nothing the verifier trusts changes until /accept, including edits to an already active profile.
       await sendTelegramMessage(chatId, `${confirmation}\nType \`/accept\` to lock in these changes.`);
-      break;
-    }
-
-    case '/resumemode': {
-      const mode = args[0]?.toLowerCase();
-      if (!mode) {
-        await sendTelegramMessage(
-          chatId,
-          `📄 *Current Resume Mode:* \`${settings.resume_mode}\`\n\n` +
-            `• \`generated\`: Tailored 1-page ATS template created per application (default).\n` +
-            `• \`uploaded\`: Your uploaded PDF is attached unchanged byte-for-byte; email copy only is tailored.\n\n` +
-            `Switch with: \`/resumemode generated\` or \`/resumemode uploaded\``
-        );
-        return;
-      }
-      if (mode !== 'generated' && mode !== 'uploaded') {
-        await sendTelegramMessage(chatId, 'Usage: `/resumemode generated` or `/resumemode uploaded`');
-        return;
-      }
-
-      const result = await setResumeMode(user.id, mode);
-      if (result.outcome === 'no_stored_pdf') {
-        await sendTelegramMessage(
-          chatId,
-          '❌ Uploaded mode needs an accepted resume with a stored PDF. Send your resume as a PDF, `/accept` it, then try again.'
-        );
-        return;
-      }
-      await sendTelegramMessage(
-        chatId,
-        result.outcome === 'unchanged'
-          ? `Resume mode is already \`${mode}\`.`
-          : `✅ Resume mode updated to: \`${mode}\`.` + (result.requeued > 0 ? ` ${result.requeued} unsent application(s) will be regenerated.` : '')
-      );
       break;
     }
 
@@ -677,6 +557,254 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
         chatId,
         previous ? `⏭️ Application skipped (was \`${previous}\`).` : 'No application with that id can be skipped (it is not yours, or it is already sending or sent).'
       );
+      break;
+    }
+
+    case '/preview': {
+      const appId = args[0];
+      if (!appId || !UUID_PATTERN.test(appId)) {
+        await sendTelegramMessage(chatId, 'Usage: `/preview <application_id>`');
+        return;
+      }
+      const rows = (await sql`
+        select a.id, a.status, a.contact_email, a.email_subject, a.email_body, a.resume_blob_url,
+               j.role, j.company
+        from applications a
+        left join jobs j on j.id = a.job_id
+        where a.id = ${appId} and a.user_id = ${user.id}
+        limit 1
+      `) as Array<{
+        id: string;
+        status: string;
+        contact_email: string | null;
+        email_subject: string | null;
+        email_body: string | null;
+        resume_blob_url: string | null;
+        role: string | null;
+        company: string | null;
+      }>;
+      if (rows.length === 0) {
+        await sendTelegramMessage(chatId, 'No application of yours matches that id.');
+        return;
+      }
+      const a = rows[0];
+      await sendTelegramMessage(
+        chatId,
+        `📧 *Draft Preview (${a.status})*\n\n` +
+          `• *Role:* ${a.role || 'Software Role'}\n` +
+          `• *Company:* ${a.company || 'Unknown'}\n` +
+          `• *To:* \`${a.contact_email || 'Unknown'}\`\n` +
+          `• *Subject:* ${a.email_subject || '(none)'}\n` +
+          `• *Uploaded PDF:* ${a.resume_blob_url ? `${extractResumeFilename(a.resume_blob_url)} ✅` : 'Missing ⚠️'}\n\n` +
+          `${a.email_body || '(No body)'}\n\n` +
+          `• Make changes: \`/edit ${a.id} <your instructions>\`\n` +
+          `• Send now: \`/send ${a.id}\`\n` +
+          `• Skip: \`/skip ${a.id}\``
+      );
+      break;
+    }
+
+    case '/edit': {
+      const appId = args[0];
+      const instructions = args.slice(1).join(' ').trim();
+      if (!appId || !UUID_PATTERN.test(appId) || !instructions) {
+        await sendTelegramMessage(chatId, 'Usage: `/edit <application_id> <changes you want>`');
+        return;
+      }
+      const rows = (await sql`
+        select a.id, a.status, a.route, a.contact_email, a.email_subject, a.email_body, a.cover_note,
+               a.facts_version_id, j.role, j.company, j.requirements
+        from applications a
+        left join jobs j on j.id = a.job_id
+        where a.id = ${appId} and a.user_id = ${user.id}
+        limit 1
+      `) as Array<{
+        id: string;
+        status: string;
+        route: string | null;
+        contact_email: string | null;
+        email_subject: string | null;
+        email_body: string | null;
+        cover_note: string | null;
+        facts_version_id: number | null;
+        role: string | null;
+        company: string | null;
+        requirements: string[] | null;
+      }>;
+      if (rows.length === 0) {
+        await sendTelegramMessage(chatId, 'No application of yours matches that id.');
+        return;
+      }
+      const a = rows[0];
+      if (a.status === 'sent' || a.status === 'sending') {
+        await sendTelegramMessage(chatId, `Cannot edit an application that is already \`${a.status}\`.`);
+        return;
+      }
+      const [fv] = (await sql`
+        select facts from facts_versions where id = ${a.facts_version_id} limit 1
+      `) as Array<{ facts: MasterFacts }>;
+      if (!fv) {
+        await sendTelegramMessage(chatId, '❌ Could not load your resume facts for this application.');
+        return;
+      }
+      await sendTelegramMessage(chatId, '✏️ Regenerating draft with your changes...');
+      const regenerated = await regenerateApplicationDraft(
+        { role: a.role, company: a.company, requirements: a.requirements || [] },
+        fv.facts,
+        {
+          subject: a.email_subject || '',
+          body: a.email_body || '',
+          coverNote: a.cover_note,
+        },
+        instructions,
+        a.route === 'link' ? 'link' : 'email'
+      );
+      const newBody = [
+        regenerated.email_slots.opening_line,
+        regenerated.email_slots.project_fit_sentences,
+        regenerated.email_slots.gap_sentence,
+      ]
+        .filter(Boolean)
+        .join('\n\n');
+      const nextStatus = a.route === 'link' ? 'link_ready' : 'ready';
+      await sql`
+        update applications
+        set email_subject = ${regenerated.email_slots.subject},
+            email_body = ${newBody},
+            cover_note = ${regenerated.cover_note},
+            status = ${nextStatus},
+            updated_at = now()
+        where id = ${a.id} and user_id = ${user.id}
+      `;
+      await sendTelegramMessage(
+        chatId,
+        `✅ *Draft Regenerated!*\n\n` +
+          `*To:* \`${a.contact_email || 'Unknown'}\`\n` +
+          `*Subject:* ${regenerated.email_slots.subject}\n\n` +
+          `${newBody}\n\n` +
+          `• Edit again: \`/edit ${a.id} <changes>\`\n` +
+          `• Proceed to send: \`/send ${a.id}\`\n` +
+          `• Skip: \`/skip ${a.id}\``
+      );
+      break;
+    }
+
+    case '/send': {
+      const appId = args[0];
+      if (!appId || !UUID_PATTERN.test(appId)) {
+        await sendTelegramMessage(chatId, 'Usage: `/send <application_id>`');
+        return;
+      }
+      const rows = (await sql`
+        select id, status, route from applications where id = ${appId} and user_id = ${user.id} limit 1
+      `) as Array<{ id: string; status: string; route: string | null }>;
+      if (rows.length === 0) {
+        await sendTelegramMessage(chatId, 'No application of yours matches that id.');
+        return;
+      }
+      const app = rows[0];
+      if (app.status === 'needs_manual' || app.status === 'rejected') {
+        await sendTelegramMessage(chatId, `⚠️ That application is flagged. Reply \`/proceed ${app.id}\` first.`);
+        return;
+      }
+      if (app.status !== 'ready' && app.status !== 'verified') {
+        await sendTelegramMessage(chatId, `Application is currently \`${app.status}\`.`);
+        return;
+      }
+      if (settings.dry_run) {
+        await updateUserSettings(user.id, {
+          dry_run: false,
+          ramp_stage: Math.max(settings.ramp_stage, 1),
+        });
+      }
+      const result = await runSendPass();
+      const [updated] = (await sql`
+        select status from applications where id = ${appId} and user_id = ${user.id} limit 1
+      `) as Array<{ status: string }>;
+      if (updated?.status === 'sent') {
+        await sendTelegramMessage(chatId, '📬 Email sent from your Gmail!');
+      } else {
+        await sendTelegramMessage(
+          chatId,
+          `⏳ Not sent yet (status: \`${updated?.status || app.status}\`). Waiting (caps or spacing): ${result.skipped}.`
+        );
+      }
+      break;
+    }
+
+    case '/proceed': {
+      const appId = args[0];
+      if (!appId || !UUID_PATTERN.test(appId)) {
+        await sendTelegramMessage(chatId, 'Usage: `/proceed <application_id>`');
+        return;
+      }
+      const res = await proceedApplication(user.id, appId);
+      if (res.outcome === 'not_found') {
+        const jobProceeded = await proceedJob(user.id, appId);
+        if (jobProceeded) {
+          await sendTelegramMessage(chatId, '⏳ Approved! Processing flagged post...');
+          try {
+            await runOwnCron('process');
+            await dispatchLinkApplications();
+            await runSendPass();
+
+            const [j] = (await sql`
+              select id, status, status_reason, company, role
+              from jobs where id = ${appId} limit 1;
+            `) as Array<{ id: string; status: string; status_reason: string | null; company: string | null; role: string | null }>;
+
+            const [a] = (await sql`
+              select id, status, fit_score, status_reason
+              from applications where job_id = ${appId} and user_id = ${user.id} limit 1;
+            `) as Array<{ id: string; status: string; fit_score: number | null; status_reason: string | null }>;
+
+            if (a) {
+              await sendTelegramMessage(
+                chatId,
+                `🎯 *Flagged Post Evaluated!*\n\n` +
+                  `• *Role:* ${j?.role || 'Software Role'}\n` +
+                  `• *Company:* ${j?.company || 'Unknown'}\n` +
+                  `• *Fit Score:* ${a.fit_score ?? 'N/A'}/100\n` +
+                  `• *Application Status:* \`${a.status}\`` +
+                  (a.status_reason ? `\n• *Note:* ${a.status_reason}` : '')
+              );
+            } else if (j && (j.status === 'rejected' || j.status === 'needs_manual')) {
+              await sendTelegramMessage(
+                chatId,
+                `⚠️ *Post Still Flagged (${j.status}):*\n\n` +
+                  (j.role ? `• *Role:* ${j.role}\n` : '') +
+                  (j.company ? `• *Company:* ${j.company}\n` : '') +
+                  `• *Reason:* \`${j.status_reason || j.status}\``
+              );
+            } else {
+              await sendTelegramMessage(chatId, '✅ Flagged post processed!');
+            }
+          } catch (err: unknown) {
+            console.error('Proceed job failed:', err);
+            await sendTelegramMessage(chatId, '❌ Error processing flagged post. Details are in the server log.');
+          }
+          return;
+        }
+        await sendTelegramMessage(chatId, 'No flagged application or post of yours matches that id.');
+        return;
+      }
+      if (res.outcome === 'cannot_proceed') {
+        await sendTelegramMessage(chatId, `❌ Cannot auto-proceed (\`${res.reason}\`).`);
+        return;
+      }
+      if (res.outcome === 'requeued_matched') {
+        await sendTelegramMessage(chatId, '⏳ Approved! Tailoring and processing your application...');
+        await runOwnCron('process');
+        await dispatchLinkApplications();
+        await runSendPass();
+        await sendTelegramMessage(chatId, '✅ Flagged application processed!');
+      } else if (res.route === 'link') {
+        await dispatchLinkApplications();
+        await sendTelegramMessage(chatId, '✅ Flagged application approved and link card dispatched!');
+      } else {
+        await runSendPass();
+        await sendTelegramMessage(chatId, '✅ Flagged application approved and queued/sent!');
+      }
       break;
     }
 
@@ -804,10 +932,9 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
 
           await sendTelegramMessage(chatId, `⏳ Post ingested! Running Gemini extraction and matching...`);
 
-          // 3. Run processing and delivery passes
+          // 3. Run processing and link-card dispatch (email apps wait for /send confirmation)
           await runOwnCron('process');
           await dispatchLinkApplications();
-          await runSendPass();
 
           // 4. Query status for this job
           const jobRows = (await sql`
@@ -827,7 +954,7 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
           if (jobRows.length > 0) {
             const j = jobRows[0];
             const appRows = (await sql`
-              select id, status, fit_score, status_reason, route
+              select id, status, fit_score, status_reason, route, contact_email, email_subject, email_body
               from applications where job_id = ${j.id} and user_id = ${user.id} limit 1;
             `) as Array<{
               id: string;
@@ -835,21 +962,30 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
               fit_score: number | null;
               status_reason: string | null;
               route: string | null;
+              contact_email: string | null;
+              email_subject: string | null;
+              email_body: string | null;
             }>;
 
             if (appRows.length > 0) {
               const a = appRows[0];
-              const userSettings = await getUserSettings(user.id);
+              const draftPreview =
+                (a.status === 'ready' || a.status === 'verified') && a.email_subject
+                  ? `\n\n📧 *Draft Ready:*\n` +
+                    `*To:* \`${a.contact_email || j.contact_email || 'Unknown'}\`\n` +
+                    `*Subject:* ${a.email_subject}\n` +
+                    (a.email_body ? `\n${a.email_body.slice(0, 600)}\n` : '')
+                  : '';
               const statusNote =
                 a.status === 'sent'
-                  ? userSettings?.dry_run
-                    ? `\n🧪 *Dry-run preview generated and sent above!*`
-                    : `\n📬 *An email application was sent directly from your Gmail!*`
+                  ? `\n📬 *An email application was sent directly from your Gmail!*`
                   : a.status === 'link_ready'
                     ? `\n🔗 *Manual-apply card and tailored resume sent above!*`
                     : a.status === 'ready' || a.status === 'verified'
-                      ? `\n⏳ *Application is ready in the send queue.*`
-                      : '';
+                      ? `${draftPreview}\n• Preview full draft: \`/preview ${a.id}\`\n• Make changes: \`/edit ${a.id} <changes>\`\n• Proceed to send: \`/send ${a.id}\`\n• Skip: \`/skip ${a.id}\``
+                      : a.status === 'needs_manual' || a.status === 'rejected'
+                        ? `\n⚠️ *Flagged for review.* Reply \`/proceed ${a.id}\` to proceed anyway, or \`/skip ${a.id}\` to skip.`
+                        : '';
 
               await sendTelegramMessage(
                 chatId,
@@ -864,10 +1000,11 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
             } else if (j.status === 'rejected' || j.status === 'needs_manual') {
               await sendTelegramMessage(
                 chatId,
-                `⚠️ *Post Not Automated (${j.status}):*\n\n` +
+                `⚠️ *Post Flagged (${j.status}):*\n\n` +
                   (j.role ? `• *Role:* ${j.role}\n` : '') +
                   (j.company ? `• *Company:* ${j.company}\n` : '') +
-                  `• *Reason:* \`${j.status_reason || j.status}\``
+                  `• *Reason:* \`${j.status_reason || j.status}\`\n\n` +
+                  `Reply \`/proceed ${j.id}\` to proceed anyway.`
               );
             } else {
               await sendTelegramMessage(chatId, `✅ Finished processing post!`);
@@ -890,12 +1027,14 @@ export async function handleTelegramMessage(chatId: number, text: string, userna
           `• \`/connect\` - Link your Gmail\n` +
           `• \`/pause\` / \`/resume\` - Pause/resume sends\n` +
           `• \`/cap <N>\` - Set daily send cap\n` +
-          `• \`/dry on|off\` - Toggle dry-run mode\n` +
-          `• \`/window <H1> <H2>\` - Set send window\n` +
-          `• \`/timezone <zone>\` - Set timezone\n` +
           `• \`/set years <N>\` - Set years of experience\n` +
+          `• \`/set relocation yes|no\` - Set relocation preference\n` +
           `• \`/accept\` - Approve proposed facts\n` +
-          `• \`/resumemode\` - Check or switch resume mode\n` +
+          `• \`/preview <id>\` - Preview drafted email\n` +
+          `• \`/edit <id> <changes>\` - Regenerate email with changes\n` +
+          `• \`/send <id>\` - Proceed to send email\n` +
+          `• \`/proceed <id>\` - Proceed with a flagged application/post\n` +
+          `• \`/skip <id>\` - Skip an application\n` +
           `• \`/done <id>\` - Mark link job as applied`
       );
       break;
@@ -990,14 +1129,17 @@ export async function handleTelegramDocument(
 
     let sourceFileUrl: string | null = null;
     if (isPdf && sha256Hex) {
+      const rawBaseName = (document.file_name || 'Resume.pdf').split(/[\\/]/).pop() || 'Resume.pdf';
+      const sanitized = rawBaseName.replace(/[^a-zA-Z0-9._ -]/g, '_').trim() || 'Resume.pdf';
+      const safeFileName = sanitized.toLowerCase().endsWith('.pdf') ? sanitized : `${sanitized}.pdf`;
       const hasValidBlobToken =
         Boolean(process.env.BLOB_READ_WRITE_TOKEN) &&
         !process.env.BLOB_READ_WRITE_TOKEN?.includes('vercel_blob_rw_token_here');
       if (hasValidBlobToken) {
-        const blob = await put(`resumes/${user.id}/uploaded-${sha256Hex}.pdf`, buffer, { access: 'public' });
+        const blob = await put(`resumes/${user.id}/${sha256Hex.slice(0, 8)}/${safeFileName}`, buffer, { access: 'public' });
         sourceFileUrl = blob.url;
       } else {
-        sourceFileUrl = `data:application/pdf;base64,${buffer.toString('base64')}`;
+        sourceFileUrl = `data:application/pdf;name=${encodeURIComponent(safeFileName)};base64,${buffer.toString('base64')}`;
       }
     }
 

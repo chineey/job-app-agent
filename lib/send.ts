@@ -203,9 +203,6 @@ export async function authorizeSend(
     if (sendState.too_soon) {
       return { outcome: 'skipped', reason: 'Minimum send spacing interval not yet reached.' };
     }
-    if (!isWithinSendWindow(account.timezone, account.send_window_start, account.send_window_end)) {
-      return { outcome: 'skipped', reason: 'Current time is outside candidate send window.' };
-    }
 
     const recipient = app.contact_email;
     const recipientDomain = extractDomain(recipient);
@@ -299,6 +296,36 @@ export async function authorizeSend(
   return decision;
 }
 
+const PDF_DATA_URL_RE = /^data:application\/pdf(?:;name=([^;]+))?;base64,(.+)$/;
+
+/** Decodes an inline base64 PDF data URL (with optional `;name=...`), or returns null for HTTP URLs. */
+export function decodePdfDataUrl(url: string): Buffer | null {
+  const match = url.match(PDF_DATA_URL_RE);
+  return match ? Buffer.from(match[2], 'base64') : null;
+}
+
+/** Extracts the original uploaded PDF filename from a data URL or Blob/HTTP URL. */
+export function extractResumeFilename(url: string | null | undefined, fallback = 'Resume.pdf'): string {
+  if (!url) return fallback;
+  const dataMatch = url.match(PDF_DATA_URL_RE);
+  if (dataMatch?.[1]) {
+    try {
+      const decoded = decodeURIComponent(dataMatch[1]).trim();
+      if (decoded) return decoded;
+    } catch {
+      return fallback;
+    }
+  }
+  try {
+    const pathname = new URL(url).pathname;
+    const last = decodeURIComponent(pathname.split('/').pop() || '').trim();
+    if (last && last.toLowerCase().endsWith('.pdf')) return last;
+  } catch {
+    // Ignore non-URL strings
+  }
+  return fallback;
+}
+
 interface AttemptForSend {
   id: string;
   user_id: string;
@@ -354,8 +381,9 @@ export async function executeSend(userId: string, attemptId: string): Promise<Se
     if (!attempt.resume_blob_url) {
       throw new Error('Application has no resume URL.');
     }
-    if (attempt.resume_blob_url.startsWith('data:application/pdf;base64,')) {
-      resume = Buffer.from(attempt.resume_blob_url.slice('data:application/pdf;base64,'.length), 'base64');
+    const inlinePdf = decodePdfDataUrl(attempt.resume_blob_url);
+    if (inlinePdf) {
+      resume = inlinePdf;
     } else {
       const res = await fetch(attempt.resume_blob_url, { cache: 'no-store' });
       if (!res.ok) {
@@ -375,7 +403,7 @@ export async function executeSend(userId: string, attemptId: string): Promise<Se
     subject: attempt.subject,
     bodyText: attempt.email_body || '',
     rfcMessageId: attempt.rfc_message_id,
-    pdfAttachment: { filename: 'Resume.pdf', contentBuffer: resume },
+    pdfAttachment: { filename: extractResumeFilename(attempt.resume_blob_url), contentBuffer: resume },
   });
 
   const started = await sql`

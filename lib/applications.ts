@@ -25,6 +25,83 @@ export async function skipApplication(userId: string, applicationId: string): Pr
   return skipped.previous_status;
 }
 
+export type ProceedResult =
+  | { outcome: 'ready'; route: 'email' | 'link' }
+  | { outcome: 'requeued_matched' }
+  | { outcome: 'cannot_proceed'; reason: string }
+  | { outcome: 'not_found' };
+
+/**
+ * Approves a flagged application (`needs_manual` or `rejected`) so it can proceed.
+ * Drafted `needs_manual` applications move to `ready` / `link_ready`; `rejected` (e.g. `low_fit`)
+ * applications move back to `matched` for tailoring.
+ */
+export async function proceedApplication(userId: string, applicationId: string): Promise<ProceedResult> {
+  assertUserScope(userId);
+  const rows = (await sql`
+    select id, status, status_reason, route, email_subject, email_body
+    from applications
+    where id = ${applicationId} and user_id = ${userId} and status in ('needs_manual', 'rejected')
+    limit 1
+  `) as Array<{
+    id: string;
+    status: string;
+    status_reason: string | null;
+    route: string | null;
+    email_subject: string | null;
+    email_body: string | null;
+  }>;
+
+  if (rows.length === 0) return { outcome: 'not_found' };
+  const row = rows[0];
+
+  if (row.status === 'needs_manual') {
+    if (!row.email_subject || !row.email_body) {
+      return { outcome: 'cannot_proceed', reason: row.status_reason || 'missing_draft' };
+    }
+    const route: 'email' | 'link' = row.route === 'link' ? 'link' : 'email';
+    const nextStatus = route === 'link' ? 'link_ready' : 'ready';
+    const updated = await sql`
+      update applications
+      set status = ${nextStatus}, status_reason = 'user_proceeded', updated_at = now()
+      where id = ${applicationId} and user_id = ${userId} and status = 'needs_manual'
+      returning id
+    `;
+    if (updated.length === 0) return { outcome: 'not_found' };
+    await logEvent(userId, 'application_proceeded', { previousStatus: row.status, nextStatus }, null, applicationId);
+    return { outcome: 'ready', route };
+  }
+
+  const updated = await sql`
+    update applications
+    set status = 'matched', status_reason = 'user_proceeded', updated_at = now()
+    where id = ${applicationId} and user_id = ${userId} and status = 'rejected'
+    returning id
+  `;
+  if (updated.length === 0) return { outcome: 'not_found' };
+  await logEvent(userId, 'application_proceeded', { previousStatus: row.status, nextStatus: 'matched' }, null, applicationId);
+  return { outcome: 'requeued_matched' };
+}
+
+/**
+ * Approves a flagged job (`rejected` or `needs_manual`) so `process` re-evaluates it
+ * with scam/role flags bypassed.
+ */
+export async function proceedJob(userId: string, jobId: string): Promise<boolean> {
+  assertUserScope(userId);
+  const updated = await sql`
+    update jobs
+    set status = 'found', status_reason = 'user_proceeded', claim_token = null, locked_at = null, updated_at = now()
+    where id = ${jobId}
+      and status in ('rejected', 'needs_manual')
+      and (submitted_by = ${userId} or source <> 'manual')
+    returning id
+  `;
+  if (updated.length === 0) return false;
+  await logEvent(userId, 'job_proceeded', {}, jobId, null);
+  return true;
+}
+
 export async function recentSends(
   userId: string
 ): Promise<Array<{ contact_email: string; email_subject: string | null; applied_at: string }>> {
