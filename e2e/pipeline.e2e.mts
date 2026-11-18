@@ -141,9 +141,7 @@ describe('pipeline', () => {
     assert.deepEqual(await applicationStatuses(), ['sent']);
   });
 
-  // Known Dev A bug, reported in docs/integration-findings.md; todo scenarios run but do not fail CI.
-  // Dev A: ingest resumes from the newest stored job, which is the batch's oldest post, so it re-reads (and pays for) posts it has seen; searchRecentJobPosts already returns highestId, unused.
-  it.todo('ingest resumes after the newest post it has seen', async () => {
+  it('ingest resumes after the newest post it has seen', async () => {
     fake.xPosts = [hiringPost('3000'), hiringPost('2000'), hiringPost('1000')];
 
     evidence.runs = [await runCron('ingest'), await runCron('ingest')];
@@ -152,9 +150,7 @@ describe('pipeline', () => {
     assert.equal(fake.xSearches[1].since_id, '3000', 'the second search starts after the newest post, not the oldest');
   });
 
-  // Known Dev A bug, reported in docs/integration-findings.md; todo scenarios run but do not fail CI.
-  // Dev A: ingest never stores author_handle, and thread expansion only runs when it is set, so it never runs.
-  it.todo('ingest stores the post author, so author-only thread expansion can run', async () => {
+  it('ingest stores the post author, so author-only thread expansion can run', async () => {
     fake.xPosts = [hiringPost('1000')];
 
     evidence.ingest = await runCron('ingest');
@@ -164,9 +160,7 @@ describe('pipeline', () => {
     assert.ok(rows[0].author_handle, 'thread expansion requires author_handle');
   });
 
-  // Known Dev A bug, reported in docs/integration-findings.md; todo scenarios run but do not fail CI.
-  // Dev A: ingest never stores the post's URL entities, so apply_link is always null and every link or form job ends as needs_manual (link_missing).
-  it.todo('a link job reaches its user as a card with the apply link from the post', async () => {
+  it('a link job reaches its user as a card with the apply link from the post', async () => {
     await seedCandidate(2001, true);
     fake.pipeline.extract = { ...fake.pipeline.extract, apply_method: 'link' };
     fake.xPosts = [{ ...hiringPost('1000'), text: 'We are hiring a Backend Engineer at Acme. Apply here: https://apply.acme-careers.test/jobs/42' }];

@@ -554,7 +554,15 @@ export async function startFakeProviders(): Promise<FakeProviders> {
       const posts = (url.searchParams.get('query') ?? '').includes('conversation_id:')
         ? []
         : state.xPosts.filter((post) => !sinceId || BigInt(post.id) > BigInt(sinceId));
-      return json(res, 200, { data: posts, includes: { media: [], users: [] }, meta: { result_count: posts.length } });
+      // Like the real API: authors come back under includes.users, links as URL entities.
+      const data = posts.map((post) => ({
+        ...post,
+        entities: {
+          urls: (post.text.match(/https?:\/\/\S+/g) ?? []).map((link) => ({ url: link, expanded_url: link })),
+        },
+      }));
+      const users = [...new Set(posts.map((post) => post.author_id))].map((id) => ({ id, username: `author${id}` }));
+      return json(res, 200, { data, includes: { media: [], users }, meta: { result_count: posts.length } });
     }
 
     if (req.method === 'PUT' && url.pathname === '/blob/') {
